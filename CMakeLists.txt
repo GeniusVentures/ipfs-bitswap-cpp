@@ -27,12 +27,14 @@ find_package(c-ares CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(soralog CONFIG REQUIRED)
 
-add_compile_definitions(SPDLOG_FMT_EXTERNAL)
-
 # BOOST library
 find_package(Boost REQUIRED COMPONENTS random filesystem date_time regex)
 
+add_compile_definitions(SPDLOG_FMT_EXTERNAL)
+include_directories(${tsl_hat_trie_INCLUDE_DIR})
+
 add_subdirectory(src)
+add_subdirectory(example)
 
 # Tests building
 find_package(GTest CONFIG REQUIRED)
