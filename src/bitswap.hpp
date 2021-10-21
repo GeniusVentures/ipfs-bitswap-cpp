@@ -10,6 +10,8 @@
 #include <libp2p/protocol/base_protocol.hpp>
 #include <libp2p/host/host.hpp>
 #include <libp2p/multi/content_identifier.hpp>
+#include <libp2p/connection/stream.hpp>
+#include <libp2p/multi/uvarint.hpp>
 
 //namespace libp2p::multi {
 //  class Multiaddress;
@@ -73,6 +75,10 @@ private:
     void onNewStream(
         libp2p::protocol::BaseProtocol::StreamResult rstream, 
         std::shared_ptr<std::vector<uint8_t>> request);
+    void onLengthRead(libp2p::outcome::result<libp2p::multi::UVarint> varint,
+        std::shared_ptr<libp2p::connection::Stream> stream);
+    void onMessageRead(libp2p::outcome::result<size_t> res,
+        std::shared_ptr<std::vector<uint8_t>> buffer);
 
 //    /**
 //        * Handler for new connections, established by or with our host
