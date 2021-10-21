@@ -6,10 +6,11 @@
 
 #include <boost/assert.hpp>
 //#include <boost/di.hpp>
-#include <libp2p/multi/uvarint.hpp>
 #include <libp2p/multi/content_identifier_codec.hpp>
 
 #include <proto/bitswap.pb.h>
+#include <libp2p/basic/varint_reader.hpp>
+#include <gsl/span>
 
 namespace
 {
@@ -234,7 +235,9 @@ void Bitswap::onStreamAccepted(libp2p::protocol::BaseProtocol::StreamResult rstr
         return;
     }
 
-    auto peer_id_res = rstream.value()->remotePeerId();
+    auto stream = rstream.value();
+
+    auto peer_id_res = stream->remotePeerId();
     if (!peer_id_res)
     {
         logger_->error("no peer id for accepted stream, msg='{}'",
@@ -243,8 +246,119 @@ void Bitswap::onStreamAccepted(libp2p::protocol::BaseProtocol::StreamResult rstr
     }
 
     //auto ctx = findContext(peer_id_res.value(), true);
-    //logger()->trace("accepted stream from peer={}", ctx->str);
+    logger_->trace("accepted stream from peer={}", stream->remotePeerId().value().toBase58());
     //ctx->onStreamAccepted(std::move(rstream.value()));
+
+    // TODO: Move to session class. An example can be found in libp2p kademlia session.
+    if (stream->isClosedForRead()) {
+        //close(Error::STREAM_RESET);
+        logger_->error("stream is closed");
+        return;
+    }
+
+    //if (closed_) {
+    //    return;
+    //}
+
+    libp2p::basic::VarintReader::readVarint(
+        stream,
+        [wp = weak_from_this(), stream](libp2p::outcome::result<libp2p::multi::UVarint> varint) {
+        if (auto self = wp.lock())
+            self->onLengthRead(std::move(varint), std::move(stream));
+    });
+}
+
+void Bitswap::onLengthRead(libp2p::outcome::result<libp2p::multi::UVarint> varint,
+    std::shared_ptr<libp2p::connection::Stream> stream)
+{
+    if (stream->isClosedForRead()) {
+        //close(Error::STREAM_RESET);
+        logger_->error("stream is closed");
+        return;
+    }
+
+    //if (closed_) {
+    //    return;
+    //}
+
+    if (varint.has_error()) {
+        //close(varint.error());
+        logger_->error("varint error {}", varint.error());
+        return;
+    }
+
+    auto msg_len = varint.value().toUInt64();
+    auto buffer = std::make_shared<std::vector<uint8_t>>();
+    buffer->resize(msg_len);
+
+    stream->read(gsl::span(buffer->data(), buffer->size()),
+        msg_len, 
+        [wp = weak_from_this(), buffer](libp2p::outcome::result<size_t> res) {
+            if (auto self = wp.lock()) 
+            {
+                self->onMessageRead(std::forward<decltype(res)>(res), std::move(buffer));
+            }
+        });
+}
+
+void Bitswap::onMessageRead(libp2p::outcome::result<size_t> res,
+    std::shared_ptr<std::vector<uint8_t>> buffer)
+{
+    //cancelReadingTimeout();
+
+    //if (closed_) 
+    //{
+    //    return;
+    //}
+
+    if (!res) 
+    {
+        //close(res.as_failure());
+        logger_->error("failed result received");
+        return;
+    }
+
+    if (buffer->size() != res.value()) {
+        //close(Error::MESSAGE_PARSE_ERROR);
+        logger_->error("corrupted stream size");
+        return;
+    }
+
+    logger_->debug("{} bytes read", res.value());
+
+    bitswap_pb::Message msg;
+    if (!msg.ParseFromArray(buffer->data(), buffer->size())) 
+    {
+        //close(Error::MESSAGE_DESERIALIZE_ERROR);
+        logger_->error("MESSAGE_DESERIALIZE_ERROR");
+        return;
+    }
+
+    for (int i = 0; i < msg.blocks_size(); ++i)
+    {
+        std::cout << msg.blocks()[i];
+    }
+
+    std::cout << std::endl;
+
+    // Propogate to session host
+    //if (!pocessed) 
+    //{
+    //    if (auto session_host = session_host_.lock()) {
+    //        session_host->onMessage(shared_from_this(), std::move(msg));
+    //    }
+    //}
+
+    //// Continue to wait some response
+    //if (!response_handlers_.empty()) 
+    //{
+    //    read();
+    //}
+
+    //if (canBeClosed()) 
+    //{
+    //    close();
+    //}
 }
 
 void Bitswap::onStreamConnected(
@@ -279,9 +393,13 @@ void Bitswap::onNewStream(
     logger_->debug("connected to {}", addr);
     logger_->debug("outgoing stream with {}", stream->remotePeerId().value().toBase58());
     auto session = std::make_shared<Session>(stream);
-    if (!session->write(request))
+    if (session->write(request))
     {
-        logger_->debug("Request sent to {}", addr);
+        logger_->debug("request sent to {}", addr);
+    }
+    else
+    {
+        logger_->error("request cannot be sent sent to {}", addr);
     }
 }
 } // sgns::ipfs_bitswap
