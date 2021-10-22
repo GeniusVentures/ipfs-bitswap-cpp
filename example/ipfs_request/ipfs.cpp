@@ -7,11 +7,32 @@
 #include <libp2p/log/configurator.hpp>
 #include <libp2p/protocol/identify/identify.hpp>
 #include <libp2p/multi/content_identifier_codec.hpp>
+#include <libp2p/protocol/ping/ping.hpp>
 
 #include <iostream>
 
 namespace {
-    const std::string logger_config(R"(
+std::shared_ptr<libp2p::protocol::PingClientSession> pingSession_;
+
+void OnSessionPing(libp2p::outcome::result<std::shared_ptr<libp2p::protocol::PingClientSession>> session)
+{
+    if (session)
+    {
+        pingSession_ = std::move(session.value());
+    }
+}
+
+void OnNewConnection(
+    const std::weak_ptr<libp2p::connection::CapableConnection>& conn,
+    std::shared_ptr<libp2p::protocol::Ping> ping) {
+    if (conn.expired()) {
+        return;
+    }
+    auto sconn = conn.lock();
+    ping->startPinging(sconn, &OnSessionPing);
+}
+
+const std::string logger_config(R"(
 # ----------------
 sinks:
   - name: console
@@ -81,6 +102,24 @@ int main(int argc, const char* argv[])
             << upsert_res.error().message() << std::endl;
         return EXIT_FAILURE;
     }
+
+    // Ping protocol setup
+    libp2p::protocol::PingConfig pingConfig {};
+    auto rng = std::make_shared<libp2p::crypto::random::BoostRandomGenerator>();
+    auto ping = std::make_shared<libp2p::protocol::Ping>(*host, host->getBus(), *io, rng, pingConfig);
+
+    auto subsOnNewConnection = host->getBus().getChannel<libp2p::network::event::OnNewConnectionChannel>().subscribe(
+        [ping](auto&& conn) {
+            return OnNewConnection(conn, ping);
+    });
+
+    host->setProtocolHandler(
+        ping->getProtocolId(),
+        [ping](libp2p::protocol::BaseProtocol::StreamResult rstream) {
+            ping->handle(std::move(rstream));
+    });
+
+
 
     // Bitswap setup
     auto bitswap = std::make_shared<sgns::ipfs_bitswap::Bitswap>(*host);
