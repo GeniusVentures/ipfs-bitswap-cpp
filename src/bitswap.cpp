@@ -22,82 +22,82 @@ namespace sgns::ipfs_bitswap
 class Session : public std::enable_shared_from_this<Session>
 {
 public:
-explicit Session(std::shared_ptr<libp2p::connection::Stream> stream)
-    : stream_(std::move(stream)),
-    incoming_(std::make_shared<std::vector<uint8_t>>(1 << 12)) {};
-
-bool read()
-{
-    if (stream_->isClosedForRead())
+    explicit Session(std::shared_ptr<libp2p::connection::Stream> stream, Logger logger)
+        : stream_(std::move(stream))
+        , logger_(logger)
+        , incoming_(std::make_shared<std::vector<uint8_t>>(1 << 12)) 
     {
-        close();
-        return false;
-    }
+    };
 
-    stream_->readSome(
-        gsl::span(incoming_->data(), static_cast<ssize_t>(incoming_->size())),
-        incoming_->size(),
-        [self = shared_from_this()](libp2p::outcome::result<size_t> result)
+    bool read()
     {
-        if (!result)
+        if (stream_->isClosedForRead())
         {
-            self->close();
-            std::cout << self->stream_->remotePeerId().value().toBase58()
-                << " - closed at reading" << std::endl;
-            return;
+            close();
+            return false;
         }
-        std::cout << self->stream_->remotePeerId().value().toBase58() << " > "
-            << std::string(self->incoming_->begin(),
-                self->incoming_->begin()
-                + static_cast<ssize_t>(result.value()));
-        std::cout.flush();
-        self->read();
-    });
-    return true;
-}
 
-bool write(const std::shared_ptr<std::vector<uint8_t>>& buffer)
-{
-    if (stream_->isClosedForWrite()) {
-        close();
-        return false;
+        stream_->readSome(
+            gsl::span(incoming_->data(), static_cast<ssize_t>(incoming_->size())),
+            incoming_->size(),
+            [self = shared_from_this()](libp2p::outcome::result<size_t> result)
+        {
+            if (!result)
+            {
+                self->close();
+                self->logger_->debug("{} - closed at reading", self->stream_->remotePeerId().value().toBase58());
+                return;
+            }
+            self->logger_->debug("data read from stream {} > {}", self->stream_->remotePeerId().value().toBase58(),
+                std::string(self->incoming_->begin(), self->incoming_->begin() + static_cast<ssize_t>(result.value())));
+            self->read();
+        });
+        return true;
     }
 
-    stream_->write(
-        gsl::span(buffer->data(), static_cast<ssize_t>(buffer->size())),
-        buffer->size(),
-        [self = shared_from_this(),
-        buffer](libp2p::outcome::result<size_t> result) {
-        if (!result) {
-            self->close();
-            std::cout << self->stream_->remotePeerId().value().toBase58()
-                << " - closed at writting" << std::endl;
-            return;
+    bool write(const std::shared_ptr<std::vector<uint8_t>>& buffer)
+    {
+        if (stream_->isClosedForWrite()) {
+            close();
+            return false;
         }
-        std::cout << self->stream_->remotePeerId().value().toBase58() << " < "
-            << std::string(buffer->begin(),
-                buffer->begin()
-                + static_cast<ssize_t>(result.value()));
-        std::cout.flush();
-    });
-    return true;
-}
 
-void close()
-{
-    stream_->close([self = shared_from_this()](auto) {});
-    //sessions.erase(shared_from_this());
-}
+        stream_->write(
+            gsl::span(buffer->data(), static_cast<ssize_t>(buffer->size())),
+            buffer->size(),
+            [self = shared_from_this(),
+            buffer](libp2p::outcome::result<size_t> result) {
+                if (!result) {
+                    self->close();
+                    self->logger_->debug("{} - closed at writting", self->stream_->remotePeerId().value().toBase58());
+                    return;
+                }
+                self->logger_->debug("data written to stream {} < {} from {} bytes", 
+                    self->stream_->remotePeerId().value().toBase58(), 
+                    //std::string(buffer->begin(), buffer->begin() + static_cast<ssize_t>(result.value()))
+                    static_cast<ssize_t>(result.value()), buffer->size()
+                );
+            }
+        );
+        return true;
+    }
 
-bool operator<(const Session& other)
-{
-    return stream_->remotePeerId().value()
-        < other.stream_->remotePeerId().value();
-}
+    void close()
+    {
+        stream_->close([self = shared_from_this()](auto) {});
+        //sessions.erase(shared_from_this());
+    }
+
+    bool operator<(const Session& other)
+    {
+        return stream_->remotePeerId().value()
+            < other.stream_->remotePeerId().value();
+    }
 
 private:
-std::shared_ptr<libp2p::connection::Stream> stream_;
-std::shared_ptr<std::vector<uint8_t>> incoming_;
+    std::shared_ptr<libp2p::connection::Stream> stream_;
+    std::shared_ptr<std::vector<uint8_t>> incoming_;
+    Logger logger_;
 };
 
 Bitswap::Bitswap(libp2p::Host& host)
@@ -334,12 +334,11 @@ void Bitswap::onMessageRead(libp2p::outcome::result<size_t> res,
         return;
     }
 
+    logger_->debug("{} blocks received", msg.blocks_size());
     for (int i = 0; i < msg.blocks_size(); ++i)
     {
-        std::cout << msg.blocks()[i];
+        logger_->debug("block[{}]: {}", i, msg.blocks()[i]);
     }
-
-    std::cout << std::endl;
 
     // Propogate to session host
     //if (!pocessed) 
@@ -392,7 +391,7 @@ void Bitswap::onNewStream(
     std::string addr(stream->remoteMultiaddr().value().getStringAddress());
     logger_->debug("connected to {}", addr);
     logger_->debug("outgoing stream with {}", stream->remotePeerId().value().toBase58());
-    auto session = std::make_shared<Session>(stream);
+    auto session = std::make_shared<Session>(stream, logger_);
     if (session->write(request))
     {
         logger_->debug("request sent to {}", addr);
