@@ -24,7 +24,7 @@ target_link_libraries(ipfs-bitswap-cpp
     #p2p::p2p_inmem_address_repository
     #p2p::p2p_inmem_key_repository
     #p2p::p2p_inmem_protocol_repository
-    #p2p::p2p_gossip
+    p2p::p2p_ping
     #p2p::asio_scheduler
     spdlog::spdlog
     ${WIN_CRYPT_LIBRARY}
