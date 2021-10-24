@@ -86,7 +86,7 @@ int main(int argc, const char* argv[])
             //"/ip4/54.89.142.24/tcp/4001/p2p/QmRXP6S7qwSH4vjSrZeJUGT68ww8rQVhoFWU5Kp7UkVkPN"
         ).value();
     auto peer_id = libp2p::peer::PeerId::fromBase58(peer_address.getPeerId().value()).value();
-    
+
     auto cid = libp2p::multi::ContentIdentifierCodec::fromString("QmWATWQ7fVPP2EFGu71UkfnqhYXDYH566qy47CnJDgvs8u").value();
 
     // Add peer to address repository
@@ -96,7 +96,7 @@ int main(int argc, const char* argv[])
             pi.id,
             gsl::span(pi.addresses.data(), pi.addresses.size()),
             libp2p::peer::ttl::kPermanent);
-    if (!upsert_res) 
+    if (!upsert_res)
     {
         std::cerr << pi.id.toBase58() << " was skipped at addind to peer routing table: "
             << upsert_res.error().message() << std::endl;
@@ -104,22 +104,20 @@ int main(int argc, const char* argv[])
     }
 
     // Ping protocol setup
-    libp2p::protocol::PingConfig pingConfig {};
+    libp2p::protocol::PingConfig pingConfig{};
     auto rng = std::make_shared<libp2p::crypto::random::BoostRandomGenerator>();
     auto ping = std::make_shared<libp2p::protocol::Ping>(*host, host->getBus(), *io, rng, pingConfig);
 
     auto subsOnNewConnection = host->getBus().getChannel<libp2p::network::event::OnNewConnectionChannel>().subscribe(
         [ping](auto&& conn) {
             return OnNewConnection(conn, ping);
-    });
+        });
 
     host->setProtocolHandler(
         ping->getProtocolId(),
         [ping](libp2p::protocol::BaseProtocol::StreamResult rstream) {
             ping->handle(std::move(rstream));
-    });
-
-
+        });
 
     // Bitswap setup
     auto bitswap = std::make_shared<sgns::ipfs_bitswap::Bitswap>(*host);
@@ -138,7 +136,7 @@ int main(int argc, const char* argv[])
         host->start();
 
         bitswap->RequestBlock(peer_id, peer_address, cid);
-        });
+    });
 
     boost::asio::signal_set signals(*io, SIGINT, SIGTERM);
     signals.async_wait(

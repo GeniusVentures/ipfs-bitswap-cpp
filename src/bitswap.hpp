@@ -19,6 +19,7 @@
 
 namespace sgns::ipfs_bitswap
 {
+class Session;
 /**
 * Implementation of an Bitswap protocol
 */
@@ -79,6 +80,9 @@ private:
         std::shared_ptr<libp2p::connection::Stream> stream);
     void onMessageRead(libp2p::outcome::result<size_t> res,
         std::shared_ptr<std::vector<uint8_t>> buffer);
+    bool createBlockRequest(
+        const libp2p::multi::ContentIdentifier& cid,
+        std::vector<uint8_t>& buffer);
 
 //    /**
 //        * Handler for new connections, established by or with our host
@@ -95,6 +99,9 @@ private:
     bool started_ = false;
 
     Logger logger_ = createLogger("Bitswap");
+
+    std::shared_ptr<Session> session_;
+
 };
 } // sgns::ipfs_bitswap
 
