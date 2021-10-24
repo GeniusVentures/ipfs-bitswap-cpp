@@ -15,6 +15,7 @@
 namespace
 {
     const std::string bitswapProtocolId = "/ipfs/bitswap/1.0.0";
+
 }  // namespace
 
 namespace sgns::ipfs_bitswap
@@ -123,7 +124,7 @@ void Bitswap::start()
         if (auto self = wp.lock()) {
             self->onStreamAccepted(std::move(rstream));
         }
-});
+    });
 
 //sub_ = bus_.getChannel<network::event::OnNewConnectionChannel>().subscribe(
 //    [wp = weak_from_this()](auto&& conn) {
@@ -163,18 +164,26 @@ void Bitswap::start()
 //    });
 //}
 
-bool createBlockRequest(
+bool Bitswap::createBlockRequest(
     const libp2p::multi::ContentIdentifier& cid,
     std::vector<uint8_t>& buffer)
 {
     bitswap_pb::Message pb_msg;
     auto wantlist = pb_msg.mutable_wantlist();
     auto entry = wantlist->add_entries();
-    entry->set_block(libp2p::multi::ContentIdentifierCodec::toString(cid).value());
-    entry->set_priority(1);
+    //entry->set_block(libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+    auto encodedCID = libp2p::multi::ContentIdentifierCodec::encode(cid).value();
+    entry->set_block(encodedCID.data(), encodedCID.size());
+    entry->set_priority(2147483650);
     entry->set_cancel(false);
     entry->set_wanttype(bitswap_pb::Message_Wantlist_WantType_Block);
     entry->set_senddonthave(false);
+
+    wantlist->set_full(false);
+
+    pb_msg.set_pendingbytes(0);
+
+    logger_->debug("requested block: {}", pb_msg.wantlist().entries(0).block());
 
     size_t msg_sz = pb_msg.ByteSizeLong();
     auto varint_len = libp2p::multi::UVarint{ msg_sz };
@@ -183,7 +192,6 @@ bool createBlockRequest(
     buffer.resize(prefix_sz + msg_sz);
     memcpy(buffer.data(), varint_vec.data(), prefix_sz);
     return pb_msg.SerializeToArray(buffer.data() + prefix_sz, msg_sz);
-
 }
 
 void Bitswap::RequestBlock(
@@ -246,8 +254,18 @@ void Bitswap::onStreamAccepted(libp2p::protocol::BaseProtocol::StreamResult rstr
     }
 
     //auto ctx = findContext(peer_id_res.value(), true);
-    logger_->trace("accepted stream from peer={}", stream->remotePeerId().value().toBase58());
+    logger_->debug("accepted stream from peer: {}, isInit: {}, isClosed: {}, read: {}, write: {}",
+        stream->remotePeerId().value().toBase58(),
+        stream->isInitiator().has_failure() ? false : stream->isInitiator().value(),
+        stream->isClosed(),
+        !stream->isClosedForRead(),
+        !stream->isClosedForWrite());
     //ctx->onStreamAccepted(std::move(rstream.value()));
+
+    //if (!stream->isClosedForWrite())
+    //{
+    //    onNewStream(stream, serialized_request);
+    //}
 
     // TODO: Move to session class. An example can be found in libp2p kademlia session.
     if (stream->isClosedForRead()) {
@@ -334,6 +352,28 @@ void Bitswap::onMessageRead(libp2p::outcome::result<size_t> res,
         return;
     }
 
+    if (msg.has_wantlist())
+    {
+        logger_->debug("{} wantlist entries received. full: {}", msg.wantlist().entries_size(), msg.wantlist().full());
+        for (int i = 0; i < msg.wantlist().entries_size(); ++i)
+        {
+            auto& e = msg.wantlist().entries(i);
+            //auto blockCID = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)e.block().data(), e.block().size()));
+            //std::string sb = libp2p::multi::ContentIdentifierCodec::toString(blockCID.value()).value();
+            auto blockCID_res = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)e.block().data(), e.block().size()));
+            if (blockCID_res.has_failure())
+            {
+                logger_->error("entryidx: {}, {} block id cannot be decoded", i, e.block());
+            }
+            else
+            {
+                auto blockCID = blockCID_res.value().toPrettyString("base58");
+                logger_->debug("entryidx: {}, block: '{}', priority: {}, cancel: {}, wanttype: {}, senddonthave: {}", 
+                    i, blockCID, e.priority(), e.cancel(), e.wanttype(), e.senddonthave());
+            }
+        }
+    }
+
     logger_->debug("{} blocks received", msg.blocks_size());
     for (int i = 0; i < msg.blocks_size(); ++i)
     {
@@ -391,8 +431,8 @@ void Bitswap::onNewStream(
     std::string addr(stream->remoteMultiaddr().value().getStringAddress());
     logger_->debug("connected to {}", addr);
     logger_->debug("outgoing stream with {}", stream->remotePeerId().value().toBase58());
-    auto session = std::make_shared<Session>(stream, logger_);
-    if (session->write(request))
+    session_ = std::make_shared<Session>(stream, logger_);
+    if (session_->write(request))
     {
         logger_->debug("request sent to {}", addr);
     }
