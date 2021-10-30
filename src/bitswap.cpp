@@ -21,6 +21,7 @@ namespace sgns::ipfs_bitswap {
         : host_{ host }
         , bus_{ event_bus } 
     {
+        incoming_.resize(1024);
     }
 
 
@@ -45,6 +46,47 @@ namespace sgns::ipfs_bitswap {
             stream->isClosed(),
             !stream->isClosedForRead(),
             !stream->isClosedForWrite());
+
+        if (!stream->isClosedForRead())
+        {
+            auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
+            rw->read<bitswap_pb::Message>(
+                [ctx = shared_from_this()](libp2p::outcome::result<bitswap_pb::Message> rmsg) {
+                    if (!rmsg)
+                    {
+                        ctx->logger_->error("message didn't parsed");
+                        return;
+                    }
+                    auto msg = rmsg.value();
+
+                    ctx->logger_->debug("wantlist size {}", msg.wantlist().entries_size());
+
+                    for (int i = 0; i < msg.wantlist().entries_size(); ++i)
+                    {
+                        auto blockId = msg.wantlist().entries(i).block();
+                        auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
+                        auto scid = libp2p::peer::PeerId::fromHash(cid.value().content_address).value().toBase58();
+                        ctx->logger_->debug(scid);
+                    }
+                    
+                });
+        }
+        else
+        {
+            stream->readSome(
+                gsl::span(incoming_.data(), static_cast<ssize_t>(incoming_.size())),
+                incoming_.size(),
+                [self = shared_from_this()](libp2p::outcome::result<size_t> result) {
+                if (!result) {
+                    //self->close();
+                    self->logger_->debug("Stream closed at reading");
+                    return;
+                }
+                self->logger_->debug("{} bytes received: {}", result.value(), 
+                    std::string(self->incoming_.begin(), self->incoming_.begin() + static_cast<ssize_t>(result.value())));
+                //self->read();
+            });
+        }
     }
 
     void Bitswap::start() {
