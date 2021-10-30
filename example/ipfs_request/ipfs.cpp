@@ -120,7 +120,7 @@ int main(int argc, const char* argv[])
         });
 
     // Bitswap setup
-    auto bitswap = std::make_shared<sgns::ipfs_bitswap::Bitswap>(*host);
+    auto bitswap = std::make_shared<sgns::ipfs_bitswap::Bitswap>(*host, host->getBus());
 
     io->post([&] {
         auto listen = host->listen(ma);
