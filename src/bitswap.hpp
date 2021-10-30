@@ -55,6 +55,7 @@ namespace sgns::ipfs_bitswap {
         libp2p::event::Handle sub_;  // will unsubscribe during destruction by itself
 
         bool started_ = false;
+        std::vector<uint8_t> incoming_;
 
         Logger logger_ = createLogger("Bitswap");
     };
