@@ -36,9 +36,11 @@ namespace sgns::ipfs_bitswap {
             return;
         }
 
-        auto stream = rstream.value();
-        logger_->debug("accepted stream from peer: {}, isInit: {}, isClosed: {}, read: {}, write: {}",
+        auto& stream = rstream.value();
+        logger_->debug("accepted stream from peer: {}, {}, {}, isInit: {}, isClosed: {}, read: {}, write: {}",
             stream->remotePeerId().value().toBase58(),
+            stream->remoteMultiaddr().value().getStringAddress(),
+            stream->localMultiaddr().value().getStringAddress(),
             stream->isInitiator().has_failure() ? false : stream->isInitiator().value(),
             stream->isClosed(),
             !stream->isClosedForRead(),
@@ -105,9 +107,11 @@ namespace sgns::ipfs_bitswap {
         libp2p::protocol::BaseProtocol::StreamResult rstream,
         const libp2p::multi::ContentIdentifier& cid)
     {
-        auto stream = rstream.value();
-        logger_->debug("stream from peer: {}, isInit: {}, isClosed: {}, read: {}, write: {}",
+        auto& stream = rstream.value();
+        logger_->debug("stream to peer: {}, {}, {}, isInit: {}, isClosed: {}, read: {}, write: {}",
             stream->remotePeerId().value().toBase58(),
+            stream->remoteMultiaddr().value().getStringAddress(),
+            stream->localMultiaddr().value().getStringAddress(),
             stream->isInitiator().has_failure() ? false : stream->isInitiator().value(),
             stream->isClosed(),
             !stream->isClosedForRead(),
@@ -134,7 +138,6 @@ namespace sgns::ipfs_bitswap {
             pb_msg,
             [ctx = shared_from_this(),
             stream = std::move(stream)](auto&& written_bytes) mutable {
-
 
             ctx->messageSent(written_bytes, std::move(stream));
         });
@@ -185,7 +188,14 @@ namespace sgns::ipfs_bitswap {
             auto ctx = wp.lock();
             if (ctx)
             {
-                ctx->sendRequest(std::move(rstream), cid);
+                if (!rstream)
+                {
+                    ctx->logger_->error("no new stream created");
+                }
+                else
+                {
+                    ctx->sendRequest(std::move(rstream), cid);
+                }
             }
         });
     }
