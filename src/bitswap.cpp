@@ -1,6 +1,6 @@
 #include "bitswap.hpp"
 
-#include <proto/bitswap.pb.h>
+#include "bitswap_message.hpp"
 
 #include <string>
 #include <tuple>
@@ -23,7 +23,6 @@ namespace sgns::ipfs_bitswap {
     {
         incoming_.resize(1024);
     }
-
 
     libp2p::peer::Protocol Bitswap::getProtocolId() const
     {
@@ -62,20 +61,21 @@ namespace sgns::ipfs_bitswap {
                         ctx->logger_->error("message didn't parsed");
                         return;
                     }
-                    auto& msg = rmsg.value();
 
-                    ctx->logger_->debug("wantlist size {}", msg.wantlist().entries_size());
+                    BitswapMessage msg(rmsg.value());
 
-                    for (int i = 0; i < msg.wantlist().entries_size(); ++i)
+                    ctx->logger_->debug("wantlist size {}", msg.GetWantlistSize());
+
+                    for (int i = 0; i < msg.GetWantlistSize(); ++i)
                     {
-                        auto blockId = msg.wantlist().entries(i).block();
+                        auto blockId = msg.GetWantlistEntry(i).block();
                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
                         auto scid = libp2p::peer::PeerId::fromHash(cid.value().content_address).value().toBase58();
                         ctx->logger_->debug(scid);
                     }         
-                    for (int blockIdx = 0; blockIdx < msg.blocks_size(); ++blockIdx)
+                    for (int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx)
                     {
-                        ctx->logger_->debug("Block: {}", msg.blocks(blockIdx));
+                        ctx->logger_->debug("Block: {}", msg.GetBlock(blockIdx));
                     }
                 });
         }
@@ -128,13 +128,6 @@ namespace sgns::ipfs_bitswap {
             std::vector<libp2p::multi::Multiaddress>{ std::move(remote_peer_addr_res.value())} };
 
         logger_->debug("connected to peer {}", remote_peer_res.value().toBase58());
-        //host_.newStream(
-        //    peer_info, bitswapProtocolId,
-        //    [self{ shared_from_this() }](auto&& stream_res) {
-        //    if (!stream_res) {
-        //        return;
-        //    }
-        //});
     }
 
     void Bitswap::sendRequest(
@@ -152,20 +145,8 @@ namespace sgns::ipfs_bitswap {
             !stream->isClosedForWrite());
 
         bitswap_pb::Message pb_msg;
-        auto wantlist = pb_msg.mutable_wantlist();
-        auto entry = wantlist->add_entries();
-        //entry->set_block(libp2p::multi::ContentIdentifierCodec::toString(cid).value());
-        auto encodedCID = libp2p::multi::ContentIdentifierCodec::encode(cid).value();
-        entry->set_block(encodedCID.data(), encodedCID.size());
-        entry->set_priority(1);
-        entry->set_cancel(false);
-        entry->set_wanttype(bitswap_pb::Message_Wantlist_WantType_Block);
-        entry->set_senddonthave(false);
-
-        wantlist->set_full(true);
-        pb_msg.set_pendingbytes(0);
-
-        auto entries_size = pb_msg.wantlist().entries_size();
+        BitswapMessage msg(pb_msg);
+        msg.AddWantlistEntry(cid, true);
 
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
         rw->write<bitswap_pb::Message>(

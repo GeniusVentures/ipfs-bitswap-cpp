@@ -59,6 +59,6 @@ namespace sgns::ipfs_bitswap {
 
         Logger logger_ = createLogger("Bitswap");
     };
-}  // namespace libp2p::protocol
+}  // ipfs_bitswap
 
 #endif  // IPFS_BITSWAP_HPP

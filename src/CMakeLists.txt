@@ -2,6 +2,8 @@
 add_library(ipfs-bitswap-cpp
     bitswap.hpp
     bitswap.cpp
+    bitswap_message.cpp
+    bitswap_message.hpp
     logger.cpp
     logger.hpp
     )
