@@ -47,7 +47,12 @@ namespace sgns::ipfs_bitswap {
             !stream->isClosedForRead(),
             !stream->isClosedForWrite());
 
-        if (!stream->isClosedForRead())
+        // Current yamux stream implementation allows to read pending data from a stream that is
+        // closed for read.
+        //bool isStreamClosedForRead = stream->isClosedForRead();
+        bool isStreamClosedForRead = false;
+
+        if (!isStreamClosedForRead)
         {
             auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
             rw->read<bitswap_pb::Message>(
@@ -57,7 +62,7 @@ namespace sgns::ipfs_bitswap {
                         ctx->logger_->error("message didn't parsed");
                         return;
                     }
-                    auto msg = rmsg.value();
+                    auto& msg = rmsg.value();
 
                     ctx->logger_->debug("wantlist size {}", msg.wantlist().entries_size());
 
@@ -67,25 +72,12 @@ namespace sgns::ipfs_bitswap {
                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
                         auto scid = libp2p::peer::PeerId::fromHash(cid.value().content_address).value().toBase58();
                         ctx->logger_->debug(scid);
+                    }         
+                    for (int blockIdx = 0; blockIdx < msg.blocks_size(); ++blockIdx)
+                    {
+                        ctx->logger_->debug("Block: {}", msg.blocks(blockIdx));
                     }
-                    
                 });
-        }
-        else
-        {
-            stream->readSome(
-                gsl::span(incoming_.data(), static_cast<ssize_t>(incoming_.size())),
-                incoming_.size(),
-                [self = shared_from_this()](libp2p::outcome::result<size_t> result) {
-                if (!result) {
-                    //self->close();
-                    self->logger_->debug("Stream closed at reading");
-                    return;
-                }
-                self->logger_->debug("{} bytes received: {}", result.value(), 
-                    std::string(self->incoming_.begin(), self->incoming_.begin() + static_cast<ssize_t>(result.value())));
-                //self->read();
-            });
         }
     }
 
@@ -167,7 +159,7 @@ namespace sgns::ipfs_bitswap {
         entry->set_block(encodedCID.data(), encodedCID.size());
         entry->set_priority(1);
         entry->set_cancel(false);
-        entry->set_wanttype(bitswap_pb::Message_Wantlist_WantType_Have);
+        entry->set_wanttype(bitswap_pb::Message_Wantlist_WantType_Block);
         entry->set_senddonthave(false);
 
         wantlist->set_full(true);
