@@ -36,11 +36,10 @@ namespace sgns::ipfs_bitswap {
         }
 
         auto& stream = rstream.value();
-        logger_->debug("accepted stream from peer: {}, {}, {}, isInit: {}, isClosed: {}, read: {}, write: {}",
+        logger_->debug("accepted stream from peer: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
             stream->remotePeerId().value().toBase58(),
             stream->remoteMultiaddr().value().getStringAddress(),
             stream->localMultiaddr().value().getStringAddress(),
-            stream->isInitiator().has_failure() ? false : stream->isInitiator().value(),
             stream->isClosed(),
             !stream->isClosedForRead(),
             !stream->isClosedForWrite());
@@ -134,11 +133,10 @@ namespace sgns::ipfs_bitswap {
         const libp2p::multi::ContentIdentifier& cid)
     {
         auto& stream = rstream.value();
-        logger_->debug("stream to peer: {}, {}, {}, isInit: {}, isClosed: {}, read: {}, write: {}",
+        logger_->debug("stream to peer: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
             stream->remotePeerId().value().toBase58(),
             stream->remoteMultiaddr().value().getStringAddress(),
             stream->localMultiaddr().value().getStringAddress(),
-            stream->isInitiator().has_failure() ? false : stream->isInitiator().value(),
             stream->isClosed(),
             !stream->isClosedForRead(),
             !stream->isClosedForWrite());
