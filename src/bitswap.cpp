@@ -21,7 +21,6 @@ namespace sgns::ipfs_bitswap {
         : host_{ host }
         , bus_{ event_bus } 
     {
-        incoming_.resize(1024);
     }
 
     libp2p::peer::Protocol Bitswap::getProtocolId() const
