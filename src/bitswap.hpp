@@ -10,15 +10,27 @@
 #include <libp2p/protocol/base_protocol.hpp>
 #include <libp2p/host/host.hpp>
 #include <libp2p/multi/content_identifier.hpp>
+#include <libp2p/outcome/outcome.hpp>
 
-namespace sgns::ipfs_bitswap {
+namespace sgns::ipfs_bitswap 
+{
     /**
     * /bitswap/1.0.0 protocol implementation
     * It allows to get a block from remote peer
     */
     class Bitswap : public libp2p::protocol::BaseProtocol,
-        public std::enable_shared_from_this<Bitswap> {
+        public std::enable_shared_from_this<Bitswap> 
+    {
     public:
+        typedef libp2p::multi::ContentIdentifier CID;
+        typedef std::function<void(libp2p::outcome::result<std::string>)> BlockCallback;
+
+        enum class BitswapError
+        {
+            OUTBOUND_STREAM_FAILURE = 1,
+            MESSAGE_SENDING_FAILURE,
+        };
+
         /**
         * Creates a bitswap protocol instance
         * @param host - local host
@@ -53,7 +65,8 @@ namespace sgns::ipfs_bitswap {
         void RequestBlock(
             const libp2p::peer::PeerId& peer,
             boost::optional<libp2p::multi::Multiaddress> address,
-            const libp2p::multi::ContentIdentifier& cid);
+            const CID& cid,
+            BlockCallback onBlockCallback);
     private:
         /**
         * Handler for new connections, established by or with our host
@@ -69,19 +82,25 @@ namespace sgns::ipfs_bitswap {
         */
         void sendRequest(
             std::shared_ptr<libp2p::connection::Stream> stream,
-            const libp2p::multi::ContentIdentifier& cid);
+            const libp2p::multi::ContentIdentifier& cid,
+            BlockCallback onBlockCallback);
 
         void messageSent(
-            libp2p::outcome::result<size_t> writtenBytes, std::shared_ptr<libp2p::connection::Stream> stream);
+            libp2p::outcome::result<size_t> writtenBytes, 
+            std::shared_ptr<libp2p::connection::Stream> stream,
+            BlockCallback onBlockCallback);
 
         libp2p::Host& host_;
         libp2p::event::Bus& bus_;
         libp2p::event::Handle sub_;  // will unsubscribe during destruction by itself
 
         bool started_ = false;
+        //std::map<CID, std::list<BlockCallback>> requestCallbacks_;
 
         Logger logger_ = createLogger("Bitswap");
     };
 }  // ipfs_bitswap
+
+OUTCOME_HPP_DECLARE_ERROR_2(sgns::ipfs_bitswap, Bitswap::BitswapError);
 
 #endif  // IPFS_BITSWAP_HPP
