@@ -10,6 +10,11 @@
 
 #include <boost/assert.hpp>
 
+OUTCOME_CPP_DEFINE_CATEGORY_3(sgns::ipfs_bitswap, Bitswap::BitswapError, e) 
+{
+    return "Bitswap::BitswapError";
+}
+
 namespace
 {
     const std::string bitswapProtocolId = "/ipfs/bitswap/1.0.0";
@@ -130,7 +135,8 @@ namespace sgns::ipfs_bitswap {
 
     void Bitswap::sendRequest(
         std::shared_ptr<libp2p::connection::Stream> stream,
-        const libp2p::multi::ContentIdentifier& cid)
+        const libp2p::multi::ContentIdentifier& cid,
+        BlockCallback onBlockCallback)
     {
         bitswap_pb::Message pb_msg;
         BitswapMessage msg(pb_msg);
@@ -140,18 +146,24 @@ namespace sgns::ipfs_bitswap {
         rw->write<bitswap_pb::Message>(
             pb_msg,
             [ctx = shared_from_this(),
-            stream = std::move(stream)](auto&& writtenBytes) mutable {
+            stream = std::move(stream),
+            onBlockCallback = std::move(onBlockCallback)](auto&& writtenBytes) mutable {
 
-            ctx->messageSent(writtenBytes, std::move(stream));
+            ctx->messageSent(writtenBytes, std::move(stream), std::move(onBlockCallback));
         });
     }
 
     void Bitswap::messageSent(
-        libp2p::outcome::result<size_t> writtenBytes, std::shared_ptr<libp2p::connection::Stream> stream) {
+        libp2p::outcome::result<size_t> writtenBytes,
+        std::shared_ptr<libp2p::connection::Stream> stream,
+        BlockCallback onBlockCallback)
+    {
         if (!writtenBytes)
         {
             logger_->error("cannot write bitswap message to stream to peer: {}", writtenBytes.error().message());
-            return stream->reset();
+            stream->reset();
+            onBlockCallback(BitswapError::MESSAGE_SENDING_FAILURE);
+            return;
         }
 
         logger_->info("successfully written a bitswap message message to peer: {}", writtenBytes.value());
@@ -172,7 +184,8 @@ namespace sgns::ipfs_bitswap {
     void Bitswap::RequestBlock(
         const libp2p::peer::PeerId& peer,
         boost::optional<libp2p::multi::Multiaddress> address,
-        const libp2p::multi::ContentIdentifier& cid)
+        const CID& cid,
+        BlockCallback onBlockCallback)
     {
         libp2p::peer::PeerInfo pi{ peer, {address.value()} };
 
@@ -181,12 +194,15 @@ namespace sgns::ipfs_bitswap {
         if (connectedness == libp2p::Host::Connectedness::CAN_NOT_CONNECT)
         {
             logger_->debug("Peer {} is not connectible", pi.id.toBase58());
+            onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+            return;
         }
 
         host_.newStream(
             pi,
             bitswapProtocolId,
-            [wp = weak_from_this(), cid](libp2p::protocol::BaseProtocol::StreamResult rstream)
+            [wp = weak_from_this(), cid = std::move(cid), onBlockCallback = std::move(onBlockCallback)]
+                (libp2p::protocol::BaseProtocol::StreamResult rstream)
         {
             auto ctx = wp.lock();
             if (ctx)
@@ -194,6 +210,7 @@ namespace sgns::ipfs_bitswap {
                 if (!rstream)
                 {
                     ctx->logger_->error("no new stream created");
+                    onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
                 }
                 else
                 {
@@ -205,7 +222,7 @@ namespace sgns::ipfs_bitswap {
                         stream->isClosed(),
                         !stream->isClosedForRead(),
                         !stream->isClosedForWrite());
-                    ctx->sendRequest(std::move(stream), cid);
+                    ctx->sendRequest(std::move(stream), std::move(cid), std::move(onBlockCallback));
                 }
             }
         });
