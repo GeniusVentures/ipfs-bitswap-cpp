@@ -17,9 +17,9 @@ namespace
 
 namespace sgns::ipfs_bitswap {
     Bitswap::Bitswap(libp2p::Host& host,
-        libp2p::event::Bus& event_bus)
+        libp2p::event::Bus& eventBus)
         : host_{ host }
-        , bus_{ event_bus } 
+        , bus_{ eventBus } 
     {
     }
 
@@ -56,7 +56,7 @@ namespace sgns::ipfs_bitswap {
                 [ctx = shared_from_this()](libp2p::outcome::result<bitswap_pb::Message> rmsg) {
                     if (!rmsg)
                     {
-                        ctx->logger_->error("message didn't parsed");
+                        ctx->logger_->error("bitswap message cannot be decoded");
                         return;
                     }
 
@@ -129,18 +129,9 @@ namespace sgns::ipfs_bitswap {
     }
 
     void Bitswap::sendRequest(
-        libp2p::protocol::BaseProtocol::StreamResult rstream,
+        std::shared_ptr<libp2p::connection::Stream> stream,
         const libp2p::multi::ContentIdentifier& cid)
     {
-        auto& stream = rstream.value();
-        logger_->debug("stream to peer: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
-            stream->remotePeerId().value().toBase58(),
-            stream->remoteMultiaddr().value().getStringAddress(),
-            stream->localMultiaddr().value().getStringAddress(),
-            stream->isClosed(),
-            !stream->isClosedForRead(),
-            !stream->isClosedForWrite());
-
         bitswap_pb::Message pb_msg;
         BitswapMessage msg(pb_msg);
         msg.AddWantlistEntry(cid, true);
@@ -149,21 +140,21 @@ namespace sgns::ipfs_bitswap {
         rw->write<bitswap_pb::Message>(
             pb_msg,
             [ctx = shared_from_this(),
-            stream = std::move(stream)](auto&& written_bytes) mutable {
+            stream = std::move(stream)](auto&& writtenBytes) mutable {
 
-            ctx->messageSent(written_bytes, std::move(stream));
+            ctx->messageSent(writtenBytes, std::move(stream));
         });
     }
 
     void Bitswap::messageSent(
-        libp2p::outcome::result<size_t> written_bytes, std::shared_ptr<libp2p::connection::Stream> stream) {
-        if (!written_bytes)
+        libp2p::outcome::result<size_t> writtenBytes, std::shared_ptr<libp2p::connection::Stream> stream) {
+        if (!writtenBytes)
         {
-            logger_->error("cannot write bitswap message to stream to peer: {}", written_bytes.error().message());
+            logger_->error("cannot write bitswap message to stream to peer: {}", writtenBytes.error().message());
             return stream->reset();
         }
 
-        logger_->info("successfully written a bitswap message message to peer: {}", written_bytes.value());
+        logger_->info("successfully written a bitswap message message to peer: {}", writtenBytes.value());
 
         stream->close([ctx = shared_from_this()](auto&& res)
         {
@@ -206,7 +197,15 @@ namespace sgns::ipfs_bitswap {
                 }
                 else
                 {
-                    ctx->sendRequest(std::move(rstream), cid);
+                    auto stream = rstream.value();
+                    ctx->logger_->debug("outbound stream to peer: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
+                        stream->remotePeerId().value().toBase58(),
+                        stream->remoteMultiaddr().value().getStringAddress(),
+                        stream->localMultiaddr().value().getStringAddress(),
+                        stream->isClosed(),
+                        !stream->isClosedForRead(),
+                        !stream->isClosedForWrite());
+                    ctx->sendRequest(std::move(stream), cid);
                 }
             }
         });
