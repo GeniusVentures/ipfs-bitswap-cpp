@@ -73,12 +73,27 @@ namespace sgns::ipfs_bitswap {
                     {
                         auto blockId = msg.GetWantlistEntry(i).block();
                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
-                        auto scid = libp2p::peer::PeerId::fromHash(cid.value().content_address).value().toBase58();
-                        ctx->logger_->debug(scid);
-                    }         
+                        ctx->logger_->debug(libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value());
+                    }
+
                     for (int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx)
                     {
-                        ctx->logger_->debug("Block: {}", msg.GetBlock(blockIdx));
+                        const auto& block = msg.GetBlock(blockIdx);
+                        ctx->logger_->debug("Block: {}", block);
+
+                        auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(block.data(), block.size());
+                        auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)cidV0.data(), cidV0.size()));
+                        if (!cid)
+                        {
+                            ctx->logger_->error("CID cannot be decoded. {}", cid.error().message());
+                        }
+                        else
+                        {
+                            auto scid = libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value();
+                            ctx->logger_->debug("Block CID: {}", scid);
+                        }
+
+                        // @todo Get CID and call callbacks related to the CID
                     }
                 });
         }
@@ -201,7 +216,7 @@ namespace sgns::ipfs_bitswap {
         host_.newStream(
             pi,
             bitswapProtocolId,
-            [wp = weak_from_this(), cid = std::move(cid), onBlockCallback = std::move(onBlockCallback)]
+            [wp = weak_from_this(), cid, onBlockCallback]
                 (libp2p::protocol::BaseProtocol::StreamResult rstream)
         {
             auto ctx = wp.lock();
@@ -222,7 +237,7 @@ namespace sgns::ipfs_bitswap {
                         stream->isClosed(),
                         !stream->isClosedForRead(),
                         !stream->isClosedForWrite());
-                    ctx->sendRequest(std::move(stream), std::move(cid), std::move(onBlockCallback));
+                    ctx->sendRequest(std::move(stream), cid, onBlockCallback);
                 }
             }
         });
