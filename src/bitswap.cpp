@@ -91,6 +91,17 @@ namespace sgns::ipfs_bitswap {
                         {
                             auto scid = libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value();
                             ctx->logger_->debug("Block CID: {}", scid);
+
+                            std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
+                            auto itCallbacks = ctx->requestCallbacks_.find(cid.value());
+                            if (itCallbacks != ctx->requestCallbacks_.end())
+                            {
+                                for (auto callback : itCallbacks->second)
+                                {
+                                    callback(block);
+                                }
+                                ctx->requestCallbacks_.erase(itCallbacks);
+                            }
                         }
 
                         // @todo Get CID and call callbacks related to the CID
@@ -162,15 +173,17 @@ namespace sgns::ipfs_bitswap {
             pb_msg,
             [ctx = shared_from_this(),
             stream = std::move(stream),
+            cid,
             onBlockCallback = std::move(onBlockCallback)](auto&& writtenBytes) mutable {
 
-            ctx->messageSent(writtenBytes, std::move(stream), std::move(onBlockCallback));
+            ctx->messageSent(writtenBytes, std::move(stream), cid, std::move(onBlockCallback));
         });
     }
 
     void Bitswap::messageSent(
         libp2p::outcome::result<size_t> writtenBytes,
         std::shared_ptr<libp2p::connection::Stream> stream,
+        const CID& cid,
         BlockCallback onBlockCallback)
     {
         if (!writtenBytes)
@@ -182,6 +195,19 @@ namespace sgns::ipfs_bitswap {
         }
 
         logger_->info("successfully written a bitswap message message to peer: {}", writtenBytes.value());
+
+        std::lock_guard<std::mutex> callbacksGuard(mutexRequestCallbacks_);
+        auto itCallbacks = requestCallbacks_.find(cid);
+        if (itCallbacks != requestCallbacks_.end())
+        {
+            // A request for the CID has already been sent
+            itCallbacks->second.push_back(std::move(onBlockCallback));
+        }
+        else
+        {
+            std::list<BlockCallback> callbacks({ onBlockCallback });
+            requestCallbacks_.emplace(cid, std::move(callbacks));
+        }
 
         stream->close([ctx = shared_from_this()](auto&& res)
         {
@@ -216,7 +242,7 @@ namespace sgns::ipfs_bitswap {
         host_.newStream(
             pi,
             bitswapProtocolId,
-            [wp = weak_from_this(), cid, onBlockCallback]
+            [wp = weak_from_this(), cid, onBlockCallback = std::move(onBlockCallback)]
                 (libp2p::protocol::BaseProtocol::StreamResult rstream)
         {
             auto ctx = wp.lock();
@@ -237,7 +263,7 @@ namespace sgns::ipfs_bitswap {
                         stream->isClosed(),
                         !stream->isClosedForRead(),
                         !stream->isClosedForWrite());
-                    ctx->sendRequest(std::move(stream), cid, onBlockCallback);
+                    ctx->sendRequest(std::move(stream), cid, std::move(onBlockCallback));
                 }
             }
         });
