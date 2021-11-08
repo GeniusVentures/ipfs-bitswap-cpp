@@ -82,12 +82,13 @@ namespace sgns::ipfs_bitswap
         */
         void sendRequest(
             std::shared_ptr<libp2p::connection::Stream> stream,
-            const libp2p::multi::ContentIdentifier& cid,
+            const CID& cid,
             BlockCallback onBlockCallback);
 
         void messageSent(
             libp2p::outcome::result<size_t> writtenBytes, 
             std::shared_ptr<libp2p::connection::Stream> stream,
+            const CID& cid,
             BlockCallback onBlockCallback);
 
         libp2p::Host& host_;
@@ -95,7 +96,9 @@ namespace sgns::ipfs_bitswap
         libp2p::event::Handle sub_;  // will unsubscribe during destruction by itself
 
         bool started_ = false;
-        //std::map<CID, std::list<BlockCallback>> requestCallbacks_;
+
+        mutable std::mutex mutexRequestCallbacks_;
+        std::map<CID, std::list<BlockCallback>> requestCallbacks_;
 
         Logger logger_ = createLogger("Bitswap");
     };
