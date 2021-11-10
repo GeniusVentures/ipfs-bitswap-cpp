@@ -84,10 +84,15 @@ int main(int argc, const char* argv[])
             "/ip4/138.201.67.220/tcp/4001/p2p/QmNSYxZAiJHeLdkBg38roksAR9So7Y5eojks1yjEcUtZ7i"
             //"/ip4/10.0.65.121/tcp/4001/p2p/QmRXP6S7qwSH4vjSrZeJUGT68ww8rQVhoFWU5Kp7UkVkPN"
             //"/ip4/54.89.142.24/tcp/4001/p2p/QmRXP6S7qwSH4vjSrZeJUGT68ww8rQVhoFWU5Kp7UkVkPN"
+            // Local go-ipfs server
+            //"/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLRCQ7qjgme7kpvm1BW3jt84WDnDSNyAHLZQF1gv2poAB"
         ).value();
     auto peer_id = libp2p::peer::PeerId::fromBase58(peer_address.getPeerId().value()).value();
 
+    // Hello world
     auto cid = libp2p::multi::ContentIdentifierCodec::fromString("QmWATWQ7fVPP2EFGu71UkfnqhYXDYH566qy47CnJDgvs8u").value();
+    // Embedded to go-ipfs server content
+    //auto cid = libp2p::multi::ContentIdentifierCodec::fromString("QmYCvbfNbCwFR45HiNP45rwJgvatpiW38D961L5qAhUM5Y").value();
 
     // Add peer to address repository
     libp2p::peer::PeerInfo pi{ peer_id, { peer_address } };
@@ -135,7 +140,14 @@ int main(int argc, const char* argv[])
         bitswap->start();
         host->start();
 
-        bitswap->RequestBlock(peer_id, peer_address, cid);
+        bitswap->RequestBlock(peer_id, peer_address, cid, 
+            [](libp2p::outcome::result<std::string> data) 
+            {
+                if (data)
+                {
+                    std::cout << "Bitswap data received: "  << data.value() << std::endl;
+                }
+            });
     });
 
     boost::asio::signal_set signals(*io, SIGINT, SIGTERM);
