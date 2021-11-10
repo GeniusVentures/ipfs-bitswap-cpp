@@ -79,7 +79,7 @@ namespace sgns::ipfs_bitswap {
                     for (int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx)
                     {
                         const auto& block = msg.GetBlock(blockIdx);
-                        ctx->logger_->debug("Block: {}", block);
+                        ctx->logger_->debug("Block received ({} bytes)", block.size());
 
                         auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(block.data(), block.size());
                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)cidV0.data(), cidV0.size()));
@@ -103,15 +103,13 @@ namespace sgns::ipfs_bitswap {
                                 ctx->requestCallbacks_.erase(itCallbacks);
                             }
                         }
-
-                        // @todo Get CID and call callbacks related to the CID
                     }
                 });
         }
     }
 
     void Bitswap::start() {
-        // no double starts
+        // no double starts allowed
         BOOST_ASSERT(!started_);
         started_ = true;
 
@@ -161,7 +159,7 @@ namespace sgns::ipfs_bitswap {
 
     void Bitswap::sendRequest(
         std::shared_ptr<libp2p::connection::Stream> stream,
-        const libp2p::multi::ContentIdentifier& cid,
+        const CID& cid,
         BlockCallback onBlockCallback)
     {
         bitswap_pb::Message pb_msg;
@@ -173,9 +171,8 @@ namespace sgns::ipfs_bitswap {
             pb_msg,
             [ctx = shared_from_this(),
             stream = std::move(stream),
-            cid,
+            cid(cid),
             onBlockCallback = std::move(onBlockCallback)](auto&& writtenBytes) mutable {
-
             ctx->messageSent(writtenBytes, std::move(stream), cid, std::move(onBlockCallback));
         });
     }
@@ -242,8 +239,8 @@ namespace sgns::ipfs_bitswap {
         host_.newStream(
             pi,
             bitswapProtocolId,
-            [wp = weak_from_this(), cid, onBlockCallback = std::move(onBlockCallback)]
-                (libp2p::protocol::BaseProtocol::StreamResult rstream)
+            [wp = weak_from_this(), cid(cid), onBlockCallback = std::move(onBlockCallback)]
+                (libp2p::protocol::BaseProtocol::StreamResult rstream) mutable
         {
             auto ctx = wp.lock();
             if (ctx)
