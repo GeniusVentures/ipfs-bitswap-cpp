@@ -34,18 +34,26 @@ add_compile_definitions(SPDLOG_FMT_EXTERNAL)
 include_directories(${tsl_hat_trie_INCLUDE_DIR})
 
 add_subdirectory(src)
-add_subdirectory(example)
 
-# Tests building
-find_package(GTest CONFIG REQUIRED)
 option(TESTING "Build tests" OFF)
-if (TESTING)
+option(EXAMPLES "Build examples" OFF)
+
+if (TESTING OR EXAMPLES)
+    find_package(GTest CONFIG REQUIRED)
     find_package(yaml-cpp CONFIG REQUIRED)
     add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
     SET(WIN_CRYPT_LIBRARY)
     if (NOT UNIX)
         SET(WIN_CRYPT_LIBRARY crypt32)
-    endif()
+    endif ()  
+endif ()
+
+if (EXAMPLES)
+    add_subdirectory(example)   
+endif ()
+
+# Tests building
+if (TESTING)
     include(cmake/test.cmake)
     enable_testing()
     add_subdirectory(test)
@@ -56,7 +64,9 @@ set(IPFS_BITSWAP_CONFIG_DESTINATION_DIR "lib/cmake/ipfs-bitswap-cpp")
 
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" FILES_MATCHING  PATTERN "*.hpp")
 
-install(TARGETS ipfs-bitswap-cpp EXPORT ipfs-bitswap-cppTargets DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+install(TARGETS ipfs-bitswap-cpp 
+                ipfs-bitswap-proto
+        EXPORT ipfs-bitswap-cppTargets DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 
 install(EXPORT ipfs-bitswap-cppTargets
   FILE ipfs-bitswap-cppTargets.cmake
