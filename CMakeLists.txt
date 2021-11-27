@@ -30,7 +30,6 @@ find_package(soralog CONFIG REQUIRED)
 # BOOST library
 find_package(Boost REQUIRED COMPONENTS random filesystem date_time regex)
 
-add_compile_definitions(SPDLOG_FMT_EXTERNAL)
 include_directories(${tsl_hat_trie_INCLUDE_DIR})
 
 add_subdirectory(src)
