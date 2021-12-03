@@ -226,7 +226,14 @@ namespace sgns::ipfs_bitswap {
         BlockCallback onBlockCallback)
     {
         libp2p::peer::PeerInfo pi{ peer, {address.value()} };
+        RequestBlock(pi, cid, onBlockCallback);
+    }
 
+    void Bitswap::RequestBlock(
+        const libp2p::peer::PeerInfo& pi,
+        const CID& cid,
+        BlockCallback onBlockCallback)
+    {
         // Check if connectable
         auto connectedness = host_.connectedness(pi);
         if (connectedness == libp2p::Host::Connectedness::CAN_NOT_CONNECT)
