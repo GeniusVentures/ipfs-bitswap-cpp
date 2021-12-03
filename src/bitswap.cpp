@@ -41,13 +41,7 @@ namespace sgns::ipfs_bitswap {
         }
 
         auto& stream = rstream.value();
-        logger_->debug("accepted stream from peer: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
-            stream->remotePeerId().value().toBase58(),
-            stream->remoteMultiaddr().value().getStringAddress(),
-            stream->localMultiaddr().value().getStringAddress(),
-            stream->isClosed(),
-            !stream->isClosedForRead(),
-            !stream->isClosedForWrite());
+        logStreamState("accepted stream from peer", *stream);
 
         // Current yamux stream implementation allows to read pending data from a stream that is
         // closed for read.
@@ -143,16 +137,17 @@ namespace sgns::ipfs_bitswap {
             return;
         }
 
-        auto remote_peer_addr_res = conn.lock()->remoteMultiaddr();
-        if (!remote_peer_addr_res)
-        {
-            return;
-        }
+        //auto remote_peer_addr_res = conn.lock()->remoteMultiaddr();
+        //if (!remote_peer_addr_res)
+        //{
+        //    return;
+        //}
 
-        libp2p::peer::PeerInfo peer_info
-        {
-            std::move(remote_peer_res.value()),
-            std::vector<libp2p::multi::Multiaddress>{ std::move(remote_peer_addr_res.value())} };
+        //libp2p::peer::PeerInfo peer_info
+        //{
+        //    std::move(remote_peer_res.value()),
+        //    std::vector<libp2p::multi::Multiaddress>{ std::move(remote_peer_addr_res.value())} 
+        //};
 
         logger_->debug("connected to peer {}", remote_peer_res.value().toBase58());
     }
@@ -260,16 +255,26 @@ namespace sgns::ipfs_bitswap {
                 else
                 {
                     auto stream = rstream.value();
-                    ctx->logger_->debug("outbound stream to peer: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
-                        stream->remotePeerId().value().toBase58(),
-                        stream->remoteMultiaddr().value().getStringAddress(),
-                        stream->localMultiaddr().value().getStringAddress(),
-                        stream->isClosed(),
-                        !stream->isClosedForRead(),
-                        !stream->isClosedForWrite());
+                    ctx->logStreamState("outbound stream to peer", *stream);
                     ctx->sendRequest(std::move(stream), cid, std::move(onBlockCallback));
                 }
             }
         });
     }
+
+    void Bitswap::logStreamState(const std::string_view& message, libp2p::connection::Stream& stream)
+    {
+        if (logger_->should_log(spdlog::level::debug))
+        {
+            logger_->debug("{}: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
+                message,
+                stream.remotePeerId().value().toBase58(),
+                stream.remoteMultiaddr().value().getStringAddress(),
+                stream.localMultiaddr().value().getStringAddress(),
+                stream.isClosed(),
+                !stream.isClosedForRead(),
+                !stream.isClosedForWrite());
+        }
+    }
+
 }  // namespace sgns::ipfs_bitswap
