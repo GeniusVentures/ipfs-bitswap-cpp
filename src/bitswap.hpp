@@ -61,10 +61,22 @@ namespace sgns::ipfs_bitswap
         * @param peer - remote peer id
         * @param address - remote peer address
         * @param cid - block content identifier
+        * @param onBlockCallback - a callback that is called when data is received
         */
         void RequestBlock(
             const libp2p::peer::PeerId& peer,
             boost::optional<libp2p::multi::Multiaddress> address,
+            const CID& cid,
+            BlockCallback onBlockCallback);
+
+        /**
+        * Requests a block from a remote peer
+        * @param pi - remote peer info
+        * @param cid - block content identifier
+        * @param onBlockCallback - a callback that is called when data is received
+        */
+        void RequestBlock(
+            const libp2p::peer::PeerInfo& pi,
             const CID& cid,
             BlockCallback onBlockCallback);
     private:
