@@ -103,6 +103,8 @@ namespace sgns::ipfs_bitswap
             const CID& cid,
             BlockCallback onBlockCallback);
 
+        void logStreamState(const std::string_view& message, libp2p::connection::Stream& stream);
+
         libp2p::Host& host_;
         libp2p::event::Bus& bus_;
         libp2p::event::Handle sub_;  // will unsubscribe during destruction by itself
