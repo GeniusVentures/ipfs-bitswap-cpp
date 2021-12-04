@@ -215,16 +215,6 @@ namespace sgns::ipfs_bitswap {
     }
 
     void Bitswap::RequestBlock(
-        const libp2p::peer::PeerId& peer,
-        boost::optional<libp2p::multi::Multiaddress> address,
-        const CID& cid,
-        BlockCallback onBlockCallback)
-    {
-        libp2p::peer::PeerInfo pi{ peer, {address.value()} };
-        RequestBlock(pi, cid, onBlockCallback);
-    }
-
-    void Bitswap::RequestBlock(
         const libp2p::peer::PeerInfo& pi,
         const CID& cid,
         BlockCallback onBlockCallback)
