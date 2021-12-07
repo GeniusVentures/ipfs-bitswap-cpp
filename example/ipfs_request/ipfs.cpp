@@ -32,6 +32,34 @@ void OnNewConnection(
     ping->startPinging(sconn, &OnSessionPing);
 }
 
+bool RequestBlock(
+    std::shared_ptr<sgns::ipfs_bitswap::Bitswap> bitswap,
+    const sgns::ipfs_bitswap::CID& cid,
+    std::vector<libp2p::multi::Multiaddress>::iterator addressBeginIt,
+    std::vector<libp2p::multi::Multiaddress>::iterator addressEndIt)
+{
+    if (addressBeginIt != addressEndIt)
+    {
+        auto peerId = libp2p::peer::PeerId::fromBase58(addressBeginIt->getPeerId().value()).value();
+        auto address = *addressBeginIt;
+        bitswap->RequestBlock({ peerId, { address } }, cid,
+            [bitswap, cid, addressBeginIt, addressEndIt](libp2p::outcome::result<std::string> data)
+        {
+            if (data)
+            {
+                std::cout << "Bitswap data received: " << data.value() << std::endl;
+                return true;
+            }
+            else
+            {
+                return RequestBlock(bitswap, cid, addressBeginIt + 1, addressEndIt);
+            }
+        });
+    }
+
+    return false;
+}
+
 const std::string logger_config(R"(
 # ----------------
 sinks:
@@ -79,15 +107,22 @@ int main(int argc, const char* argv[])
     auto identify = std::make_shared<libp2p::protocol::Identify>(*host, identifyMessageProcessor, host->getBus());
 
     // CID source
-    auto peer_address =
+    std::vector< libp2p::multi::Multiaddress> peerAddresses = {
         libp2p::multi::Multiaddress::create(
-            "/ip4/138.201.67.220/tcp/4001/p2p/QmNSYxZAiJHeLdkBg38roksAR9So7Y5eojks1yjEcUtZ7i"
-            //"/ip4/10.0.65.121/tcp/4001/p2p/QmRXP6S7qwSH4vjSrZeJUGT68ww8rQVhoFWU5Kp7UkVkPN"
-            //"/ip4/54.89.142.24/tcp/4001/p2p/QmRXP6S7qwSH4vjSrZeJUGT68ww8rQVhoFWU5Kp7UkVkPN"
-            // Local go-ipfs server
-            //"/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLRCQ7qjgme7kpvm1BW3jt84WDnDSNyAHLZQF1gv2poAB"
-        ).value();
-    auto peer_id = libp2p::peer::PeerId::fromBase58(peer_address.getPeerId().value()).value();
+            // The peer doesn't return Hello world block but kademlia returns it as a peer containing the block
+            "/ip4/54.89.112.218/tcp/4001/p2p/QmSrq3jnqGAja4z96Jq9SMQFJ8TzbRAgrMLi1sTR6Ane6W").value(),
+
+        libp2p::multi::Multiaddress::create(
+            // The peer successfully returns Hello world block
+            "/ip4/138.201.67.220/tcp/4001/p2p/QmNSYxZAiJHeLdkBg38roksAR9So7Y5eojks1yjEcUtZ7i").value(),
+
+        //"/ip4/10.0.65.121/tcp/4001/p2p/QmRXP6S7qwSH4vjSrZeJUGT68ww8rQVhoFWU5Kp7UkVkPN"
+        //"/ip4/54.89.142.24/tcp/4001/p2p/QmRXP6S7qwSH4vjSrZeJUGT68ww8rQVhoFWU5Kp7UkVkPN"
+        // Local go-ipfs server
+        //"/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLRCQ7qjgme7kpvm1BW3jt84WDnDSNyAHLZQF1gv2poAB"
+    };
+
+    //auto peer_id = libp2p::peer::PeerId::fromBase58(peerAddresses.front().getPeerId().value()).value();
 
     // Hello world
     auto cid = libp2p::multi::ContentIdentifierCodec::fromString("QmWATWQ7fVPP2EFGu71UkfnqhYXDYH566qy47CnJDgvs8u").value();
@@ -95,18 +130,18 @@ int main(int argc, const char* argv[])
     //auto cid = libp2p::multi::ContentIdentifierCodec::fromString("QmYCvbfNbCwFR45HiNP45rwJgvatpiW38D961L5qAhUM5Y").value();
 
     // Add peer to address repository
-    libp2p::peer::PeerInfo pi{ peer_id, { peer_address } };
-    auto upsert_res =
-        host->getPeerRepository().getAddressRepository().upsertAddresses(
-            pi.id,
-            gsl::span(pi.addresses.data(), pi.addresses.size()),
-            libp2p::peer::ttl::kPermanent);
-    if (!upsert_res)
-    {
-        std::cerr << pi.id.toBase58() << " was skipped at addind to peer routing table: "
-            << upsert_res.error().message() << std::endl;
-        return EXIT_FAILURE;
-    }
+    //libp2p::peer::PeerInfo pi{ peer_id, { peerAddresses.front() } };
+    //auto upsert_res =
+    //    host->getPeerRepository().getAddressRepository().upsertAddresses(
+    //        pi.id,
+    //        gsl::span(pi.addresses.data(), pi.addresses.size()),
+    //        libp2p::peer::ttl::kPermanent);
+    //if (!upsert_res)
+    //{
+    //    std::cerr << pi.id.toBase58() << " was skipped at addind to peer routing table: "
+    //        << upsert_res.error().message() << std::endl;
+    //    return EXIT_FAILURE;
+    //}
 
     // Ping protocol setup
     libp2p::protocol::PingConfig pingConfig{};
@@ -125,7 +160,7 @@ int main(int argc, const char* argv[])
         });
 
     // Bitswap setup
-    auto bitswap = std::make_shared<sgns::ipfs_bitswap::Bitswap>(*host, host->getBus());
+    auto bitswap = std::make_shared<sgns::ipfs_bitswap::Bitswap>(*host, host->getBus(), io);
 
     io->post([&] {
         auto listen = host->listen(ma);
@@ -140,14 +175,7 @@ int main(int argc, const char* argv[])
         bitswap->start();
         host->start();
 
-        bitswap->RequestBlock({ peer_id, {peer_address} }, cid,
-            [](libp2p::outcome::result<std::string> data) 
-            {
-                if (data)
-                {
-                    std::cout << "Bitswap data received: "  << data.value() << std::endl;
-                }
-            });
+        RequestBlock(bitswap, cid, peerAddresses.begin(), peerAddresses.end());
     });
 
     boost::asio::signal_set signals(*io, SIGINT, SIGTERM);
