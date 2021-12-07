@@ -10,9 +10,18 @@
 
 #include <boost/assert.hpp>
 
-OUTCOME_CPP_DEFINE_CATEGORY_3(sgns::ipfs_bitswap, Bitswap::BitswapError, e) 
+OUTCOME_CPP_DEFINE_CATEGORY_3(sgns::ipfs_bitswap, BitswapError, e) 
 {
-    return "Bitswap::BitswapError";
+    using sgns::ipfs_bitswap::BitswapError;
+    switch (e) {
+    case BitswapError::OUTBOUND_STREAM_FAILURE:
+        return "failed to create an onbound stream";
+    case BitswapError::MESSAGE_SENDING_FAILURE:
+        return "cannot send bitswap message";
+    case BitswapError::REQUEST_TIMEOUT:
+        return "bitswap request timeout";
+    }
+    return "unknown bitswap error";
 }
 
 namespace
@@ -21,10 +30,42 @@ namespace
 }  // namespace
 
 namespace sgns::ipfs_bitswap {
-    Bitswap::Bitswap(libp2p::Host& host,
-        libp2p::event::Bus& eventBus)
+    BitswapRequestContext::BitswapRequestContext(
+        boost::asio::io_context& context, const CID& cid)
+        : responseTimer_(context)
+        , responseTimeout_(boost::posix_time::seconds(5))
+    {
+    }
+
+    void BitswapRequestContext::AddCallback(BlockCallback callback)
+    {
+        responseTimer_.expires_from_now(responseTimeout_);
+        responseTimer_.async_wait(std::bind(&BitswapRequestContext::HandleResponseTimeout, this));
+        callbacks_.emplace_back(std::move(callback));
+    }
+
+    void BitswapRequestContext::HandleResponse(libp2p::outcome::result<std::string> block)
+    {
+        responseTimer_.expires_at(boost::posix_time::pos_infin);
+        for (auto& callback : callbacks_)
+        {
+            callback(block);
+        }
+        callbacks_.clear();
+    }
+
+    void BitswapRequestContext::HandleResponseTimeout()
+    {
+        HandleResponse(BitswapError::OUTBOUND_STREAM_FAILURE);
+    }
+
+    Bitswap::Bitswap(
+        libp2p::Host& host,
+        libp2p::event::Bus& eventBus,
+        std::shared_ptr<boost::asio::io_context> context)
         : host_{ host }
-        , bus_{ eventBus } 
+        , bus_{ eventBus }
+        , context_(std::move(context))
     {
     }
 
@@ -87,14 +128,10 @@ namespace sgns::ipfs_bitswap {
                             ctx->logger_->debug("Block CID: {}", scid);
 
                             std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
-                            auto itCallbacks = ctx->requestCallbacks_.find(cid.value());
-                            if (itCallbacks != ctx->requestCallbacks_.end())
+                            auto itContext = ctx->requestContexts_.find(cid.value());
+                            if (itContext != ctx->requestContexts_.end())
                             {
-                                for (auto callback : itCallbacks->second)
-                                {
-                                    callback(block);
-                                }
-                                ctx->requestCallbacks_.erase(itCallbacks);
+                                itContext->second->HandleResponse(block);
                             }
                         }
                     }
@@ -152,7 +189,7 @@ namespace sgns::ipfs_bitswap {
         logger_->debug("connected to peer {}", remote_peer_res.value().toBase58());
     }
 
-    void Bitswap::sendRequest(
+    void Bitswap::writeBitswapMessageToStream(
         std::shared_ptr<libp2p::connection::Stream> stream,
         const CID& cid,
         BlockCallback onBlockCallback)
@@ -189,16 +226,17 @@ namespace sgns::ipfs_bitswap {
         logger_->info("successfully written a bitswap message message to peer: {}", writtenBytes.value());
 
         std::lock_guard<std::mutex> callbacksGuard(mutexRequestCallbacks_);
-        auto itCallbacks = requestCallbacks_.find(cid);
-        if (itCallbacks != requestCallbacks_.end())
+        auto itCallbacks = requestContexts_.find(cid);
+        if (itCallbacks != requestContexts_.end())
         {
             // A request for the CID has already been sent
-            itCallbacks->second.push_back(std::move(onBlockCallback));
+            itCallbacks->second->AddCallback(std::move(onBlockCallback));
         }
         else
         {
-            std::list<BlockCallback> callbacks({ onBlockCallback });
-            requestCallbacks_.emplace(cid, std::move(callbacks));
+            auto requestContext = std::make_shared<BitswapRequestContext>(*context_, cid);
+            requestContext->AddCallback(std::move(onBlockCallback));
+            requestContexts_.emplace(cid, std::move(requestContext));
         }
 
         stream->close([ctx = shared_from_this()](auto&& res)
@@ -246,7 +284,7 @@ namespace sgns::ipfs_bitswap {
                 {
                     auto stream = rstream.value();
                     ctx->logStreamState("outbound stream to peer", *stream);
-                    ctx->sendRequest(std::move(stream), cid, std::move(onBlockCallback));
+                    ctx->writeBitswapMessageToStream(std::move(stream), cid, std::move(onBlockCallback));
                 }
             }
         });
