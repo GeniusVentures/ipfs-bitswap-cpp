@@ -14,6 +14,31 @@
 
 namespace sgns::ipfs_bitswap 
 {
+    typedef libp2p::multi::ContentIdentifier CID;
+    typedef std::function<void(libp2p::outcome::result<std::string>)> BlockCallback;
+
+    enum class BitswapError
+    {
+        OUTBOUND_STREAM_FAILURE = 1,
+        MESSAGE_SENDING_FAILURE,
+        REQUEST_TIMEOUT
+    };
+
+    class BitswapRequestContext
+    {
+    public:
+        BitswapRequestContext(boost::asio::io_context& context, const CID& cid);
+
+        void AddCallback(BlockCallback callback);
+        void HandleResponse(libp2p::outcome::result<std::string> block);
+    private:
+        void HandleResponseTimeout();
+
+        std::list<BlockCallback> callbacks_;
+            
+        boost::asio::deadline_timer responseTimer_;
+        boost::posix_time::time_duration responseTimeout_;
+    };
     /**
     * /bitswap/1.0.0 protocol implementation
     * It allows to get a block from remote peer
@@ -22,22 +47,15 @@ namespace sgns::ipfs_bitswap
         public std::enable_shared_from_this<Bitswap> 
     {
     public:
-        typedef libp2p::multi::ContentIdentifier CID;
-        typedef std::function<void(libp2p::outcome::result<std::string>)> BlockCallback;
-
-        enum class BitswapError
-        {
-            OUTBOUND_STREAM_FAILURE = 1,
-            MESSAGE_SENDING_FAILURE,
-        };
-
         /**
         * Creates a bitswap protocol instance
         * @param host - local host
         * @param eventBus - bus to subscribe to network events
         */
-        Bitswap(libp2p::Host& host,
-                libp2p::event::Bus& eventBus);
+        Bitswap(
+            libp2p::Host& host,
+            libp2p::event::Bus& eventBus,
+            std::shared_ptr<boost::asio::io_context> context);
 
         ~Bitswap() override = default;
 
@@ -75,11 +93,11 @@ namespace sgns::ipfs_bitswap
             const std::weak_ptr<libp2p::connection::CapableConnection>& conn);
 
         /**
-        * Sends a bitswap message containing a block request to stream
+        * Write a bitswap message containing a block request to stream
         * @param stream - outbound stream
         * @param cid - requested block content identifier
         */
-        void sendRequest(
+        void writeBitswapMessageToStream(
             std::shared_ptr<libp2p::connection::Stream> stream,
             const CID& cid,
             BlockCallback onBlockCallback);
@@ -91,20 +109,22 @@ namespace sgns::ipfs_bitswap
             BlockCallback onBlockCallback);
 
         void logStreamState(const std::string_view& message, libp2p::connection::Stream& stream);
+        void handleResponseTimeout(const CID& cid);
 
         libp2p::Host& host_;
         libp2p::event::Bus& bus_;
         libp2p::event::Handle sub_;  // will unsubscribe during destruction by itself
 
+        std::shared_ptr<boost::asio::io_context> context_;
         bool started_ = false;
 
         mutable std::mutex mutexRequestCallbacks_;
-        std::map<CID, std::list<BlockCallback>> requestCallbacks_;
+        std::map<CID, std::shared_ptr<BitswapRequestContext>> requestContexts_;
 
         Logger logger_ = createLogger("Bitswap");
     };
 }  // ipfs_bitswap
 
-OUTCOME_HPP_DECLARE_ERROR_2(sgns::ipfs_bitswap, Bitswap::BitswapError);
+OUTCOME_HPP_DECLARE_ERROR_2(sgns::ipfs_bitswap, BitswapError);
 
 #endif  // IPFS_BITSWAP_HPP
