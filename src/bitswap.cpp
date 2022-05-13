@@ -102,13 +102,13 @@ namespace sgns::ipfs_bitswap {
 
                     BitswapMessage msg(rmsg.value());
 
-                    ctx->logger_->debug("wantlist size {}", msg.GetWantlistSize());
+                    ctx->logger_->debug("wantlist size: {}", msg.GetWantlistSize());
 
                     for (int i = 0; i < msg.GetWantlistSize(); ++i)
                     {
                         auto blockId = msg.GetWantlistEntry(i).block();
                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
-                        ctx->logger_->debug(libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value());
+                        ctx->logger_->trace("wantlist item[{}]: {}", i, libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value());
                     }
 
                     for (int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx)
@@ -269,7 +269,7 @@ namespace sgns::ipfs_bitswap {
         host_.newStream(
             pi,
             bitswapProtocolId,
-            [wp = weak_from_this(), cid(cid), onBlockCallback = std::move(onBlockCallback)]
+            [wp = weak_from_this(), cid(cid), pi(pi), onBlockCallback = std::move(onBlockCallback)]
                 (libp2p::protocol::BaseProtocol::StreamResult rstream) mutable
         {
             auto ctx = wp.lock();
@@ -277,13 +277,13 @@ namespace sgns::ipfs_bitswap {
             {
                 if (!rstream)
                 {
-                    ctx->logger_->error("no new stream created");
+                    ctx->logger_->error("no new outbound stream created to peer {}", pi.id.toBase58());
                     onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
                 }
                 else
                 {
                     auto stream = rstream.value();
-                    ctx->logStreamState("outbound stream to peer", *stream);
+                    ctx->logStreamState("outbound stream created", *stream);
                     ctx->writeBitswapMessageToStream(std::move(stream), cid, std::move(onBlockCallback));
                 }
             }
