@@ -152,7 +152,7 @@ namespace sgns::ipfs_bitswap {
             }
         });
 
-        sub_ = bus_.getChannel<libp2p::network::event::OnNewConnectionChannel>().subscribe(
+        sub_ = bus_.getChannel<libp2p::event::network::OnNewConnectionChannel>().subscribe(
             [wp = weak_from_this()](auto&& conn) {
             if (auto self = wp.lock()) {
                 return self->onNewConnection(conn);
@@ -271,23 +271,25 @@ namespace sgns::ipfs_bitswap {
             bitswapProtocolId,
             [wp = weak_from_this(), cid(cid), pi(pi), onBlockCallback = std::move(onBlockCallback)]
                 (libp2p::protocol::BaseProtocol::StreamResult rstream) mutable
-        {
-            auto ctx = wp.lock();
-            if (ctx)
             {
-                if (!rstream)
+                auto ctx = wp.lock();
+                if (ctx)
                 {
-                    ctx->logger_->error("no new outbound stream created to peer {}", pi.id.toBase58());
-                    onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+                    if (!rstream)
+                    {
+                        ctx->logger_->error("no new outbound stream created to peer {}", pi.id.toBase58());
+                        onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+                    }
+                    else
+                    {
+                        auto stream = rstream.value();
+                        ctx->logStreamState("outbound stream created", *stream);
+                        ctx->writeBitswapMessageToStream(std::move(stream), cid, std::move(onBlockCallback));
+                    }
                 }
-                else
-                {
-                    auto stream = rstream.value();
-                    ctx->logStreamState("outbound stream created", *stream);
-                    ctx->writeBitswapMessageToStream(std::move(stream), cid, std::move(onBlockCallback));
-                }
-            }
-        });
+            },
+            // @todo Add the timeout as an input parameter
+            std::chrono::milliseconds(1000));
     }
 
     void Bitswap::logStreamState(const std::string_view& message, libp2p::connection::Stream& stream)
