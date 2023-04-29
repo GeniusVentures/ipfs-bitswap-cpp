@@ -20,6 +20,7 @@ message Message
             bool cancel = 3;        // whether this revokes an entry
             WantType wantType = 4; // Note: defaults to enum 0, ie Block
             bool sendDontHave = 5; // Note: defaults to false
+            bytes auth = 6;
         }
 
         repeated Entry entries = 1;    // a list of wantlist entries
@@ -30,6 +31,7 @@ message Message
     {
         bytes prefix = 1;        // CID prefix (cid version, multicodec and multihash prefix (type + length)
         bytes data = 2;
+        bool auth = 3;
     }
 
     enum BlockPresenceType
@@ -42,6 +44,7 @@ message Message
     {
         bytes cid = 1;
         BlockPresenceType type = 2;
+        bytes auth = 3;
     }
 
     Wantlist wantlist = 1;
