@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.20)
+
 
 project(ipfs-bitswap-cpp VERSION 0.1)
 
