@@ -14,17 +14,16 @@ target_include_directories(ipfs-bitswap-cpp
     PRIVATE ${GSL_INCLUDE_DIR}
 )
 
-target_link_libraries(ipfs-bitswap-cpp    
+target_link_libraries(ipfs-bitswap-cpp
+    spdlog::spdlog
     ipfs-bitswap-proto
     spdlog::spdlog
-    OpenSSL::Crypto
-    OpenSSL::SSL
     Boost::Boost.DI
     p2p::p2p_basic_host
     p2p::p2p_multiaddress
     p2p::p2p_ping
     ${WIN_CRYPT_LIBRARY}
-    )
+)
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}

@@ -19,7 +19,6 @@ include(cmake/functions.cmake)
 
 # libp2p and its dependencies
 find_package(libp2p CONFIG REQUIRED)
-find_package(OpenSSL REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tsl_hat_trie CONFIG REQUIRED)
 find_package(Boost.DI CONFIG REQUIRED)
