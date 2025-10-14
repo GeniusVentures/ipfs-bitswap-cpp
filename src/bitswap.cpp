@@ -308,7 +308,7 @@ namespace sgns::ipfs_bitswap {
                 }
                 return;
             }
-            processUnixFSBlock(ctx, ctx->rootCID, blockResult.value());
+            processUnixFSBlock(ctx, ctx->rootCID, blockResult.value(), "");
         });
     }
 
