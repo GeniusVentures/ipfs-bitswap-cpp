@@ -1,6 +1,7 @@
 #include "bitswap.hpp"
 
 #include "bitswap_message.hpp"
+#include <proto/unixfs.pb.h>
 
 #include <string>
 #include <tuple>
@@ -20,6 +21,12 @@ OUTCOME_CPP_DEFINE_CATEGORY_3(sgns::ipfs_bitswap, BitswapError, e)
         return "cannot send bitswap message";
     case BitswapError::REQUEST_TIMEOUT:
         return "bitswap request timeout";
+    case BitswapError::INVALID_UNIXFS_DATA:
+        return "invalid UnixFS data format";
+    case BitswapError::IPLD_DECODE_FAILURE:
+        return "failed to decode IPLD node";
+    case BitswapError::CONTENT_REQUEST_TIMEOUT:
+        return "content request timeout";
     }
     return "unknown bitswap error";
 }
@@ -57,6 +64,13 @@ namespace sgns::ipfs_bitswap {
     void BitswapRequestContext::HandleResponseTimeout()
     {
         HandleResponse(BitswapError::OUTBOUND_STREAM_FAILURE);
+    }
+
+    ContentRequestContext::ContentRequestContext(boost::asio::io_context& context, const CID& rootCid)
+        : rootCID(rootCid)
+        , timeout(context)
+        , contentTimeout_(boost::posix_time::seconds(30)) // 30 second timeout for complete content
+    {
     }
 
     Bitswap::Bitswap(
@@ -252,6 +266,50 @@ namespace sgns::ipfs_bitswap {
         });
     }
 
+    void Bitswap::RequestContent(
+        const libp2p::peer::PeerInfo& pi,
+        const CID& cid,
+        ContentCallback onContentCallback)
+    {
+        logger_->debug("RequestContent called for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+
+        auto ctx = std::make_shared<ContentRequestContext>(*context_, cid);
+        ctx->callback = std::move(onContentCallback);
+        ctx->pendingCIDs.insert(cid);
+
+        {
+            std::lock_guard<std::mutex> guard(mutexContentRequests_);
+            contentRequests_[cid] = ctx;
+        }
+
+        // Set up timeout
+        ctx->timeout.expires_from_now(ctx->contentTimeout_);
+        ctx->timeout.async_wait([this, cid](const boost::system::error_code& ec) {
+            if (!ec) {  // Timer wasn't cancelled
+                std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                auto it = contentRequests_.find(cid);
+                if (it != contentRequests_.end() && !it->second->timedOut) {
+                    it->second->timedOut = true;
+                    it->second->callback(BitswapError::CONTENT_REQUEST_TIMEOUT);
+                    contentRequests_.erase(it);
+                }
+            }
+        });
+
+        // Start with the root CID
+        RequestBlock(pi, cid, [this, ctx, pi](libp2p::outcome::result<std::string> blockResult) {
+            if (!blockResult) {
+                if (!ctx->timedOut) {
+                    ctx->callback(blockResult.error());
+                    std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                    contentRequests_.erase(ctx->rootCID);
+                }
+                return;
+            }
+            processUnixFSBlock(ctx, ctx->rootCID, blockResult.value());
+        });
+    }
+
     void Bitswap::RequestBlock(
         const libp2p::peer::PeerInfo& pi,
         const CID& cid,
@@ -305,6 +363,112 @@ namespace sgns::ipfs_bitswap {
                 !stream.isClosedForRead(),
                 !stream.isClosedForWrite());
         }
+    }
+
+    void Bitswap::processUnixFSBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const std::string& blockData)
+    {
+        if (ctx->timedOut) {
+            return; // Don't process if already timed out
+        }
+
+        logger_->debug("Processing UnixFS block for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+
+        // Mark this CID as completed
+        ctx->pendingCIDs.erase(cid);
+        ctx->completedCIDs.insert(cid);
+
+        // Parse UnixFS data from the block
+        unixfs_pb::Data unixfsData;
+        if (!unixfsData.ParseFromString(blockData)) {
+            if (!ctx->timedOut) {
+                ctx->callback(BitswapError::INVALID_UNIXFS_DATA);
+                std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                contentRequests_.erase(ctx->rootCID);
+            }
+            return;
+        }
+
+        // Handle different UnixFS data types
+        switch (unixfsData.type()) {
+            case unixfs_pb::Data::Raw:
+            case unixfs_pb::Data::File:
+                handleFileBlock(ctx, cid, unixfsData);
+                break;
+                
+            case unixfs_pb::Data::Directory:
+                handleDirectoryBlock(ctx, cid, unixfsData);
+                break;
+                
+            default:
+                logger_->warn("Unsupported UnixFS data type: {}", unixfsData.type());
+                // For now, treat as raw data
+                handleFileBlock(ctx, cid, unixfsData);
+                break;
+        }
+
+        checkContentRequestComplete(ctx);
+    }
+
+    void Bitswap::handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const std::string& path)
+    {
+        // TODO: This is a simplified implementation - we need to handle file chunks and links properly
+        // For now, just extract the data if present
+        if (unixfsData.has_data()) {
+            UnixFSFile file;
+            file.path = path.empty() ? "" : path;
+            file.content = std::vector<char>(unixfsData.data().begin(), unixfsData.data().end());
+            file.size = unixfsData.has_filesize() ? unixfsData.filesize() : unixfsData.data().size();
+            
+            if (unixfsData.has_mode()) {
+                file.mode = unixfsData.mode();
+            }
+            if (unixfsData.has_mtime()) {
+                file.mtime = unixfsData.mtime();
+            }
+
+            ctx->collectedFiles.push_back(std::move(file));
+        }
+    }
+
+    void Bitswap::handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const std::string& basePath)
+    {
+        // TODO: This is a placeholder - we need to properly parse directory links from IPLD
+        // For now, just note that we have a directory
+        logger_->debug("Directory block processed (full implementation pending)");
+    }
+
+    void Bitswap::checkContentRequestComplete(std::shared_ptr<ContentRequestContext> ctx)
+    {
+        if (ctx->timedOut) {
+            return;
+        }
+
+        if (ctx->pendingCIDs.empty()) {
+            // All blocks received - assemble final content
+            UnixFSContent content = assembleContent(ctx);
+            ctx->timeout.cancel(); // Cancel the timeout timer
+            ctx->callback(std::move(content));
+            
+            std::lock_guard<std::mutex> guard(mutexContentRequests_);
+            contentRequests_.erase(ctx->rootCID);
+        }
+    }
+
+    UnixFSContent Bitswap::assembleContent(std::shared_ptr<ContentRequestContext> ctx)
+    {
+        UnixFSContent content;
+        
+        if (ctx->collectedFiles.size() == 1 && ctx->collectedFiles[0].path.empty()) {
+            content.type = UnixFSContent::SINGLE_FILE;
+        } else if (ctx->collectedFiles.size() > 1) {
+            content.type = UnixFSContent::MULTI_FILE_ARCHIVE;
+        } else {
+            content.type = UnixFSContent::DIRECTORY;
+        }
+        
+        content.files = std::move(ctx->collectedFiles);
+        
+        return content;
     }
 
 }  // namespace sgns::ipfs_bitswap

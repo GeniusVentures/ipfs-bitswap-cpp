@@ -9,6 +9,7 @@ add_library(ipfs-bitswap-cpp
     )
 
 add_proto_library(ipfs-bitswap-proto proto/bitswap.proto)
+add_proto_library(ipfs-unixfs-proto proto/unixfs.proto)
 
 target_include_directories(ipfs-bitswap-cpp 
     PRIVATE ${GSL_INCLUDE_DIR}
@@ -17,6 +18,7 @@ target_include_directories(ipfs-bitswap-cpp
 target_link_libraries(ipfs-bitswap-cpp
     spdlog::spdlog
     ipfs-bitswap-proto
+    ipfs-unixfs-proto
     spdlog::spdlog
     Boost::Boost.DI
     p2p::p2p_basic_host
