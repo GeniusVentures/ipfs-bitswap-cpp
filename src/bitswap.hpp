@@ -77,13 +77,31 @@ namespace sgns::ipfs_bitswap
     public:
         ContentRequestContext(boost::asio::io_context& context, const CID& rootCid);
 
+        // Enhanced chunk tracking
+        struct FileChunk {
+            std::vector<char> data;
+            size_t index;
+            CID cid;
+        };
+        
+        struct FileInProgress {
+            std::string path;
+            uint64_t totalSize = 0;
+            std::map<size_t, FileChunk> chunks; // chunk index -> chunk data
+            size_t expectedChunks = 0;
+            std::optional<uint32_t> mode;
+            std::optional<unixfs_pb::UnixTime> mtime;
+        };
+
         CID rootCID;
         libp2p::peer::PeerInfo peerInfo;  // Store peer info for additional requests
         ContentCallback callback;
         std::vector<UnixFSFile> collectedFiles;
         std::set<CID> pendingCIDs;
         std::set<CID> completedCIDs;
-        std::map<std::string, std::vector<char>> fileChunks; // path -> ordered chunks
+        
+        std::map<CID, FileInProgress> filesInProgress; // CID -> file being assembled
+        std::map<CID, std::string> cidToPath; // Track path for each CID
         
         boost::asio::deadline_timer timeout;
         bool timedOut = false;
@@ -176,8 +194,10 @@ namespace sgns::ipfs_bitswap
         void handleResponseTimeout(const CID& cid);
 
         // UnixFS content processing methods
-        void processUnixFSBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const std::string& blockData);
+        void processUnixFSBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const std::string& blockData, const std::string& path = "");
         void handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& path = "");
+        void handleFileChunk(std::shared_ptr<ContentRequestContext> ctx, const CID& chunkCid, const std::string& chunkData, size_t chunkIndex, const CID& parentCid);
+        void assembleCompleteFile(std::shared_ptr<ContentRequestContext> ctx, const CID& fileCid, const ContentRequestContext::FileInProgress& fileProgress);
         void handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& basePath = "");
         void checkContentRequestComplete(std::shared_ptr<ContentRequestContext> ctx);
         UnixFSContent assembleContent(std::shared_ptr<ContentRequestContext> ctx);
