@@ -24,6 +24,7 @@ target_link_libraries(ipfs-bitswap-cpp
     p2p::p2p_basic_host
     p2p::p2p_multiaddress
     p2p::p2p_ping
+    ipfs-lite-cpp::ipld_node
     ${WIN_CRYPT_LIBRARY}
 )
 

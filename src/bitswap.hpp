@@ -15,6 +15,7 @@
 #include <libp2p/multi/content_identifier.hpp>
 #include <libp2p/outcome/outcome.hpp>
 #include <proto/unixfs.pb.h>
+#include <ipfs_lite/ipld/impl/ipld_node_decoder_pb.hpp>
 
 namespace sgns::ipfs_bitswap 
 {
@@ -77,6 +78,7 @@ namespace sgns::ipfs_bitswap
         ContentRequestContext(boost::asio::io_context& context, const CID& rootCid);
 
         CID rootCID;
+        libp2p::peer::PeerInfo peerInfo;  // Store peer info for additional requests
         ContentCallback callback;
         std::vector<UnixFSFile> collectedFiles;
         std::set<CID> pendingCIDs;
@@ -175,8 +177,8 @@ namespace sgns::ipfs_bitswap
 
         // UnixFS content processing methods
         void processUnixFSBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const std::string& blockData);
-        void handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const std::string& path = "");
-        void handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const std::string& basePath = "");
+        void handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& path = "");
+        void handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& basePath = "");
         void checkContentRequestComplete(std::shared_ptr<ContentRequestContext> ctx);
         UnixFSContent assembleContent(std::shared_ptr<ContentRequestContext> ctx);
 

@@ -8,6 +8,7 @@
 
 #include <libp2p/basic/protobuf_message_read_writer.hpp>
 #include <libp2p/multi/content_identifier_codec.hpp>
+#include <ipfs_lite/ipld/impl/ipld_node_decoder_pb.hpp>
 
 #include <boost/assert.hpp>
 
@@ -274,6 +275,7 @@ namespace sgns::ipfs_bitswap {
         logger_->debug("RequestContent called for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
 
         auto ctx = std::make_shared<ContentRequestContext>(*context_, cid);
+        ctx->peerInfo = pi;  // Store peer info for additional requests
         ctx->callback = std::move(onContentCallback);
         ctx->pendingCIDs.insert(cid);
 
@@ -297,7 +299,7 @@ namespace sgns::ipfs_bitswap {
         });
 
         // Start with the root CID
-        RequestBlock(pi, cid, [this, ctx, pi](libp2p::outcome::result<std::string> blockResult) {
+        RequestBlock(pi, cid, [this, ctx](libp2p::outcome::result<std::string> blockResult) {
             if (!blockResult) {
                 if (!ctx->timedOut) {
                     ctx->callback(blockResult.error());
@@ -377,9 +379,50 @@ namespace sgns::ipfs_bitswap {
         ctx->pendingCIDs.erase(cid);
         ctx->completedCIDs.insert(cid);
 
-        // Parse UnixFS data from the block
+        // First, decode the IPLD structure
+        auto decoder = ipfs_lite::ipld::IPLDNodeDecoderPB();
+        auto byteSpan = gsl::span<const uint8_t>(reinterpret_cast<const uint8_t*>(blockData.data()), blockData.size());
+        auto diddecode = decoder.decode(byteSpan);
+        
+        if (!diddecode) {
+            if (!ctx->timedOut) {
+                ctx->callback(BitswapError::IPLD_DECODE_FAILURE);
+                std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                contentRequests_.erase(ctx->rootCID);
+            }
+            return;
+        }
+
+        // Process any links (additional CIDs to fetch)
+        for (size_t i = 0; i < decoder.getLinksCount(); ++i) {
+            auto linkCidData = decoder.getLinkCID(i);
+            auto subcid = libp2p::multi::ContentIdentifierCodec::decode(
+                gsl::span((uint8_t*)linkCidData.data(), linkCidData.size()));
+            
+            if (subcid && ctx->completedCIDs.find(subcid.value()) == ctx->completedCIDs.end()) {
+                // We haven't processed this CID yet
+                ctx->pendingCIDs.insert(subcid.value());
+                
+                logger_->debug("Found linked CID: {}, requesting...", libp2p::multi::ContentIdentifierCodec::toString(subcid.value()).value());
+                
+                // Request the linked CID
+                RequestBlock(ctx->peerInfo, subcid.value(), [this, ctx, subcid](libp2p::outcome::result<std::string> linkResult) {
+                    if (!linkResult) {
+                        if (!ctx->timedOut) {
+                            ctx->callback(linkResult.error());
+                            std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                            contentRequests_.erase(ctx->rootCID);
+                        }
+                        return;
+                    }
+                    processUnixFSBlock(ctx, subcid.value(), linkResult.value());
+                });
+            }
+        }
+
+        // Parse UnixFS data from the IPLD content
         unixfs_pb::Data unixfsData;
-        if (!unixfsData.ParseFromString(blockData)) {
+        if (!unixfsData.ParseFromString(decoder.getContent())) {
             if (!ctx->timedOut) {
                 ctx->callback(BitswapError::INVALID_UNIXFS_DATA);
                 std::lock_guard<std::mutex> guard(mutexContentRequests_);
@@ -392,49 +435,84 @@ namespace sgns::ipfs_bitswap {
         switch (unixfsData.type()) {
             case unixfs_pb::Data::Raw:
             case unixfs_pb::Data::File:
-                handleFileBlock(ctx, cid, unixfsData);
+                handleFileBlock(ctx, cid, unixfsData, decoder);
                 break;
                 
             case unixfs_pb::Data::Directory:
-                handleDirectoryBlock(ctx, cid, unixfsData);
+                handleDirectoryBlock(ctx, cid, unixfsData, decoder);
                 break;
                 
             default:
                 logger_->warn("Unsupported UnixFS data type: {}", unixfsData.type());
                 // For now, treat as raw data
-                handleFileBlock(ctx, cid, unixfsData);
+                handleFileBlock(ctx, cid, unixfsData, decoder);
                 break;
         }
 
         checkContentRequestComplete(ctx);
     }
 
-    void Bitswap::handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const std::string& path)
+    void Bitswap::handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& path)
     {
-        // TODO: This is a simplified implementation - we need to handle file chunks and links properly
-        // For now, just extract the data if present
-        if (unixfsData.has_data()) {
-            UnixFSFile file;
-            file.path = path.empty() ? "" : path;
-            file.content = std::vector<char>(unixfsData.data().begin(), unixfsData.data().end());
-            file.size = unixfsData.has_filesize() ? unixfsData.filesize() : unixfsData.data().size();
-            
-            if (unixfsData.has_mode()) {
-                file.mode = unixfsData.mode();
-            }
-            if (unixfsData.has_mtime()) {
-                file.mtime = unixfsData.mtime();
-            }
+        // If there are no links, this is a complete file block
+        if (decoder.getLinksCount() == 0) {
+            if (unixfsData.has_data()) {
+                UnixFSFile file;
+                file.path = path.empty() ? "" : path;
+                file.content = std::vector<char>(unixfsData.data().begin(), unixfsData.data().end());
+                file.size = unixfsData.has_filesize() ? unixfsData.filesize() : unixfsData.data().size();
+                
+                if (unixfsData.has_mode()) {
+                    file.mode = unixfsData.mode();
+                }
+                if (unixfsData.has_mtime()) {
+                    file.mtime = unixfsData.mtime();
+                }
 
-            ctx->collectedFiles.push_back(std::move(file));
+                ctx->collectedFiles.push_back(std::move(file));
+            }
+        } else {
+            // This file has multiple chunks - the linked CIDs contain the data
+            // For now, we'll need to handle this when we implement proper link following
+            logger_->debug("File with {} chunks detected - multi-chunk files not fully implemented yet", decoder.getLinksCount());
+            
+            // If there's immediate data, store it as part of the file
+            if (unixfsData.has_data()) {
+                // TODO: Store this as the first chunk and wait for linked chunks
+                UnixFSFile file;
+                file.path = path.empty() ? "" : path;
+                file.content = std::vector<char>(unixfsData.data().begin(), unixfsData.data().end());
+                file.size = unixfsData.has_filesize() ? unixfsData.filesize() : unixfsData.data().size();
+                
+                if (unixfsData.has_mode()) {
+                    file.mode = unixfsData.mode();
+                }
+                if (unixfsData.has_mtime()) {
+                    file.mtime = unixfsData.mtime();
+                }
+
+                ctx->collectedFiles.push_back(std::move(file));
+            }
         }
     }
 
-    void Bitswap::handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const std::string& basePath)
+    void Bitswap::handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& basePath)
     {
-        // TODO: This is a placeholder - we need to properly parse directory links from IPLD
-        // For now, just note that we have a directory
-        logger_->debug("Directory block processed (full implementation pending)");
+        // Directory blocks contain links to their contents
+        for (size_t i = 0; i < decoder.getLinksCount(); ++i) {
+            auto linkName = decoder.getLinkName(i);
+            if (!linkName.empty()) {
+                // This is a named entry in the directory
+                std::string childPath = basePath.empty() ? linkName : basePath + "/" + linkName;
+                logger_->debug("Directory entry: {}", childPath);
+                
+                // TODO: We need to request the linked CID and process it with the proper path
+                // This requires storing path information and peer info for recursive requests
+            }
+        }
+        
+        // For now, just log that we processed a directory
+        logger_->debug("Directory block processed with {} entries (full implementation pending)", decoder.getLinksCount());
     }
 
     void Bitswap::checkContentRequestComplete(std::shared_ptr<ContentRequestContext> ctx)
