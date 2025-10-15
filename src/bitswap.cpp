@@ -401,6 +401,12 @@ namespace sgns::ipfs_bitswap {
 
         logger_->debug("Processing UnixFS block for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
 
+        // Check if we've already processed this CID to prevent duplicates
+        if (ctx->completedCIDs.find(cid) != ctx->completedCIDs.end()) {
+            logger_->debug("CID already processed, skipping: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+            return;
+        }
+
         // Mark this CID as completed
         ctx->pendingCIDs.erase(cid);
         ctx->completedCIDs.insert(cid);
@@ -484,7 +490,15 @@ namespace sgns::ipfs_bitswap {
 
     void Bitswap::handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& path)
     {
-        std::string filePath = path.empty() ? "" : path;
+        // Use the path parameter, but if it's empty, try to look up from cidToPath
+        std::string filePath = path;
+        if (filePath.empty()) {
+            auto pathIt = ctx->cidToPath.find(cid);
+            if (pathIt != ctx->cidToPath.end()) {
+                filePath = pathIt->second;
+                logger_->debug("Found path for CID in cidToPath: {}", filePath);
+            }
+        }
         
         // If there are no links, this is a complete file block or single chunk
         if (decoder.getLinksCount() == 0) {
@@ -507,6 +521,12 @@ namespace sgns::ipfs_bitswap {
         } else {
             // This file has multiple chunks - set up for chunk assembly
             logger_->debug("Multi-chunk file detected: {} with {} chunks", filePath, decoder.getLinksCount());
+            
+            // Check if we already have this file in progress to prevent duplicates
+            if (ctx->filesInProgress.find(cid) != ctx->filesInProgress.end()) {
+                logger_->debug("File already in progress, skipping duplicate setup: {}", filePath);
+                return;
+            }
             
             ContentRequestContext::FileInProgress& fileProgress = ctx->filesInProgress[cid];
             fileProgress.path = filePath;
@@ -562,10 +582,21 @@ namespace sgns::ipfs_bitswap {
         auto fileIt = ctx->filesInProgress.find(parentCid);
         if (fileIt == ctx->filesInProgress.end()) {
             logger_->error("Received chunk for unknown file CID: {}", libp2p::multi::ContentIdentifierCodec::toString(parentCid).value());
-            return;
+            // Try to recreate the file progress entry if we can find the path
+            auto pathIt = ctx->cidToPath.find(parentCid);
+            if (pathIt != ctx->cidToPath.end()) {
+                logger_->debug("Attempting to recreate file progress entry for: {}", pathIt->second);
+                // Create a minimal file progress entry
+                ContentRequestContext::FileInProgress& fileProgress = ctx->filesInProgress[parentCid];
+                fileProgress.path = pathIt->second;
+                fileProgress.expectedChunks = 1; // We'll adjust this as we get more chunks
+            } else {
+                logger_->debug("Assembled empty directory");
+                return;
+            }
         }
         
-        auto& fileProgress = fileIt->second;
+        auto& fileProgress = ctx->filesInProgress[parentCid];
         
         // Decode the chunk data to extract the actual content
         auto decoder = ipfs_lite::ipld::IPLDNodeDecoderPB();
@@ -601,6 +632,11 @@ namespace sgns::ipfs_bitswap {
         };
         fileProgress.chunks[chunkIndex] = std::move(chunk);
         
+        // Update expected chunks if we got a higher index
+        if (chunkIndex + 1 > fileProgress.expectedChunks) {
+            fileProgress.expectedChunks = chunkIndex + 1;
+        }
+        
         logger_->debug("Stored chunk {} for file {} ({}/{} chunks)", 
                       chunkIndex, fileProgress.path, fileProgress.chunks.size(), fileProgress.expectedChunks);
         
@@ -629,6 +665,7 @@ namespace sgns::ipfs_bitswap {
         completeFile.size = fileProgress.totalSize > 0 ? fileProgress.totalSize : totalContentSize;
         
         // Concatenate chunks in order
+        size_t missingChunks = 0;
         for (size_t i = 0; i < fileProgress.expectedChunks; ++i) {
             auto chunkIt = fileProgress.chunks.find(i);
             if (chunkIt != fileProgress.chunks.end()) {
@@ -636,17 +673,33 @@ namespace sgns::ipfs_bitswap {
                 completeFile.content.insert(completeFile.content.end(), chunkData.begin(), chunkData.end());
             } else {
                 logger_->warn("Missing chunk {} for file {}", i, fileProgress.path);
+                missingChunks++;
             }
         }
         
-        logger_->info("Assembled complete file: {} ({} bytes from {} chunks)", 
-                     completeFile.path, completeFile.content.size(), fileProgress.chunks.size());
+        if (missingChunks > 0) {
+            logger_->warn("File {} assembled with {} missing chunks out of {}", 
+                         fileProgress.path, missingChunks, fileProgress.expectedChunks);
+        }
+        
+        logger_->info("Assembled complete file: {} ({} bytes from {}/{} chunks)", 
+                     completeFile.path, completeFile.content.size(), 
+                     fileProgress.chunks.size(), fileProgress.expectedChunks);
         
         // Add to collected files
         ctx->collectedFiles.push_back(std::move(completeFile));
         
         // Remove from files in progress
         ctx->filesInProgress.erase(fileCid);
+        
+        // Clear chunk mappings for this file
+        for (auto it = ctx->chunkToCidIndex.begin(); it != ctx->chunkToCidIndex.end();) {
+            if (it->second.parentCid == fileCid) {
+                it = ctx->chunkToCidIndex.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     void Bitswap::handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& basePath)
@@ -679,6 +732,12 @@ namespace sgns::ipfs_bitswap {
             // Check if we've already processed this CID
             if (ctx->completedCIDs.find(linkCid.value()) != ctx->completedCIDs.end()) {
                 logger_->debug("Already processed CID for {}, skipping", childPath);
+                continue;
+            }
+            
+            // Check if we're already processing this CID
+            if (ctx->pendingCIDs.find(linkCid.value()) != ctx->pendingCIDs.end()) {
+                logger_->debug("Already pending CID for {}, skipping duplicate", childPath);
                 continue;
             }
             

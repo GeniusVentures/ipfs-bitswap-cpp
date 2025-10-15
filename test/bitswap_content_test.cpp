@@ -230,7 +230,7 @@ groups:
         
         // Wait a bit longer to ensure all background processing completes
         std::cout << "\n[WAIT] Ensuring all content processing is complete..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::seconds(10));
         
         displayContentResults(retrieved_content);
     }
