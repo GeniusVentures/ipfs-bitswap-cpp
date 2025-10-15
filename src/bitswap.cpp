@@ -266,17 +266,8 @@ namespace sgns::ipfs_bitswap {
             requestContexts_.emplace(cid, std::move(requestContext));
         }
 
-        stream->close([ctx = shared_from_this()](auto&& res)
-        {
-            if (!res)
-            {
-                ctx->logger_->error("cannot close the stream to peer: {}", res.error().message());
-            }
-            else
-            {
-                ctx->logger_->debug("stream closed");
-            }
-        });
+        // Keep stream open for reuse - don't close it
+        logger_->debug("stream kept open for reuse");
     }
 
     void Bitswap::RequestContent(
@@ -338,6 +329,23 @@ namespace sgns::ipfs_bitswap {
             return;
         }
 
+        // First check if we have an active stream for this peer
+        {
+            std::lock_guard<std::mutex> guard(mutexActiveStreams_);
+            auto streamIt = activeStreams_.find(pi.id);
+            if (streamIt != activeStreams_.end() && !streamIt->second->isClosed()) {
+                // Reuse existing stream
+                logger_->debug("Reusing existing stream for peer {}", pi.id.toBase58());
+                writeBitswapMessageToStream(streamIt->second, cid, std::move(onBlockCallback));
+                return;
+            } else if (streamIt != activeStreams_.end()) {
+                // Remove closed stream from cache
+                activeStreams_.erase(streamIt);
+            }
+        }
+
+        // No active stream, create a new one
+        logger_->debug("Creating new stream for peer {}", pi.id.toBase58());
         host_.newStream(
             pi,
             bitswapProtocolId,
@@ -356,12 +364,18 @@ namespace sgns::ipfs_bitswap {
                     {
                         auto stream = rstream.value();
                         ctx->logStreamState("outbound stream created", *stream);
+                        
+                        // Cache the stream for reuse
+                        {
+                            std::lock_guard<std::mutex> guard(ctx->mutexActiveStreams_);
+                            ctx->activeStreams_[pi.id] = stream;
+                        }
+                        
                         ctx->writeBitswapMessageToStream(std::move(stream), cid, std::move(onBlockCallback));
                     }
                 }
             },
-            // @todo Add the timeout as an input parameter
-            std::chrono::milliseconds(1000));
+            std::chrono::milliseconds(5000));
     }
 
     void Bitswap::logStreamState(const std::string_view& message, libp2p::connection::Stream& stream)
@@ -390,6 +404,19 @@ namespace sgns::ipfs_bitswap {
         // Mark this CID as completed
         ctx->pendingCIDs.erase(cid);
         ctx->completedCIDs.insert(cid);
+
+        // Check if this CID is a chunk of a file in progress
+        auto chunkIt = ctx->chunkToCidIndex.find(cid);
+        if (chunkIt != ctx->chunkToCidIndex.end() && chunkIt->second.parentCid.has_value()) {
+            // This is a file chunk
+            const CID& parentCid = chunkIt->second.parentCid.value();
+            size_t chunkIndex = chunkIt->second.chunkIndex;
+            logger_->debug("Processing as chunk {} for file CID: {}", chunkIndex, 
+                          libp2p::multi::ContentIdentifierCodec::toString(parentCid).value());
+            handleFileChunk(ctx, cid, blockData, chunkIndex, parentCid);
+            checkContentRequestComplete(ctx);
+            return;
+        }
 
         // First, decode the IPLD structure
         auto decoder = ipfs_lite::ipld::IPLDNodeDecoderPB();
@@ -513,6 +540,7 @@ namespace sgns::ipfs_bitswap {
                 if (linkCid && ctx->completedCIDs.find(linkCid.value()) == ctx->completedCIDs.end()) {
                     ctx->pendingCIDs.insert(linkCid.value());
                     ctx->cidToPath[linkCid.value()] = filePath; // Track which file this chunk belongs to
+                    ctx->chunkToCidIndex[linkCid.value()] = ContentRequestContext::ChunkInfo(cid, i); // Track this is chunk i of file cid
                     
                     logger_->debug("Requesting file chunk {} for {}", i + 1, filePath);
                     
@@ -661,25 +689,15 @@ namespace sgns::ipfs_bitswap {
             logger_->debug("Requesting directory entry: {} -> {}", childPath, 
                           libp2p::multi::ContentIdentifierCodec::toString(linkCid.value()).value());
             
-            // Request the linked content
-            auto cidValue = linkCid.value(); // Extract the CID value
-            RequestBlock(ctx->peerInfo.value(), cidValue, [this, ctx, cidValue, childPath](libp2p::outcome::result<std::string> entryResult) {
-                if (!entryResult) {
-                    if (!ctx->timedOut) {
-                        logger_->error("Failed to fetch directory entry {}: {}", childPath, entryResult.error().message());
-                        ctx->callback(entryResult.error());
-                        std::lock_guard<std::mutex> guard(mutexContentRequests_);
-                        contentRequests_.erase(ctx->rootCID);
-                    }
-                    return;
-                }
-                
-                // Process the entry with the proper path
-                processUnixFSBlock(ctx, cidValue, entryResult.value(), childPath);
-            });
+            // Add to request queue instead of making direct request
+            auto cidValue = linkCid.value();
+            ctx->requestQueue.push(cidValue);
         }
         
         logger_->debug("Directory block processed: {} entries queued for processing", decoder.getLinksCount());
+        
+        // Process the queued directory entries
+        processRequestQueue(ctx);
     }
 
     void Bitswap::checkContentRequestComplete(std::shared_ptr<ContentRequestContext> ctx)
@@ -772,11 +790,18 @@ namespace sgns::ipfs_bitswap {
                 return;
             }
             
-            processUnixFSBlock(ctx, nextCid, result.value());
+            // Look up the path for this CID
+            std::string path = "";
+            auto pathIt = ctx->cidToPath.find(nextCid);
+            if (pathIt != ctx->cidToPath.end()) {
+                path = pathIt->second;
+            }
+            
+            processUnixFSBlock(ctx, nextCid, result.value(), path);
             
             // Process next item in queue after a short delay
             auto timer = std::make_shared<boost::asio::deadline_timer>(*context_);
-            timer->expires_from_now(boost::posix_time::milliseconds(50));
+            timer->expires_from_now(boost::posix_time::milliseconds(200));
             timer->async_wait([this, ctx, timer](const boost::system::error_code& ec) {
                 if (!ec && !ctx->timedOut) {
                     processRequestQueue(ctx);

@@ -62,7 +62,7 @@ groups:
         libp2p::log::setLoggingSystem(logging_system);
         
         auto loggerBitswap         = sgns::ipfs_bitswap::createLogger( "Bitswap" );
-        loggerBitswap->set_level( spdlog::level::err );
+        loggerBitswap->set_level( spdlog::level::trace );
         // Create event bus
         event_bus_ = std::make_shared<libp2p::event::Bus>();
         

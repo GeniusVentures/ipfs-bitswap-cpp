@@ -94,6 +94,14 @@ namespace sgns::ipfs_bitswap
             std::optional<unixfs_pb::UnixTime> mtime;
         };
 
+        struct ChunkInfo {
+            std::optional<CID> parentCid;
+            size_t chunkIndex = 0;
+            
+            ChunkInfo() = default;
+            ChunkInfo(const CID& parent, size_t index) : parentCid(parent), chunkIndex(index) {}
+        };
+
         CID rootCID;
         std::optional<libp2p::peer::PeerInfo> peerInfo;  // Store peer info for additional requests
         ContentCallback callback;
@@ -107,6 +115,7 @@ namespace sgns::ipfs_bitswap
         
         std::map<CID, FileInProgress> filesInProgress; // CID -> file being assembled
         std::map<CID, std::string> cidToPath; // Track path for each CID
+        std::map<CID, ChunkInfo> chunkToCidIndex; // chunk CID -> parent file info
         
         boost::asio::deadline_timer timeout;
         bool timedOut = false;
@@ -225,6 +234,10 @@ namespace sgns::ipfs_bitswap
         
         mutable std::mutex mutexContentRequests_;
         std::map<CID, std::shared_ptr<ContentRequestContext>> contentRequests_;
+
+        // Stream management for reusing active streams
+        mutable std::mutex mutexActiveStreams_;
+        std::map<libp2p::peer::PeerId, std::shared_ptr<libp2p::connection::Stream>> activeStreams_;
 
         Logger logger_ = createLogger("Bitswap");
     };
