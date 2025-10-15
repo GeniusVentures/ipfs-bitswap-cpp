@@ -735,15 +735,17 @@ namespace sgns::ipfs_bitswap {
                 continue;
             }
             
+            // Always ensure the path mapping is set up, even for duplicates
+            ctx->cidToPath[linkCid.value()] = childPath;
+            
             // Check if we're already processing this CID
             if (ctx->pendingCIDs.find(linkCid.value()) != ctx->pendingCIDs.end()) {
                 logger_->debug("Already pending CID for {}, skipping duplicate", childPath);
                 continue;
             }
             
-            // Add to pending and track the path
+            // Add to pending
             ctx->pendingCIDs.insert(linkCid.value());
-            ctx->cidToPath[linkCid.value()] = childPath;
             
             logger_->debug("Requesting directory entry: {} -> {}", childPath, 
                           libp2p::multi::ContentIdentifierCodec::toString(linkCid.value()).value());
