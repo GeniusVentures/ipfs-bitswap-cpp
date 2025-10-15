@@ -127,6 +127,11 @@ namespace sgns::ipfs_bitswap
             libp2p::event::Bus& eventBus,
             std::shared_ptr<boost::asio::io_context> context);
 
+        /**
+        * Initialize and register protocol handlers (call after shared_ptr construction)
+        */
+        void initialize();
+
         ~Bitswap() override = default;
 
         /**

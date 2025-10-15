@@ -84,6 +84,17 @@ namespace sgns::ipfs_bitswap {
     {
     }
 
+    void Bitswap::initialize()
+    {
+        // Register this bitswap instance as the protocol handler for bitswap protocol
+        host_.getRouter().setProtocolHandler(getProtocolId(), 
+            [weak_self = std::weak_ptr<Bitswap>(shared_from_this())](auto stream_result) {
+                if (auto self = weak_self.lock()) {
+                    self->handle(stream_result);
+                }
+            });
+    }
+
     libp2p::peer::Protocol Bitswap::getProtocolId() const
     {
         return bitswapProtocolId;

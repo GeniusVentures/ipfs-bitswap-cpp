@@ -17,6 +17,8 @@
 #include <libp2p/log/logger.hpp>
 #include <soralog/logging_system.hpp>
 #include <soralog/impl/configurator_from_yaml.hpp>
+#include <libp2p/protocol/factory/protocol_factory.hpp>
+#include <boost/format.hpp>
 
 #include "../src/bitswap.hpp"
 
@@ -28,6 +30,7 @@ private:
     std::shared_ptr<libp2p::Host> host_;
     std::shared_ptr<Bitswap> bitswap_;
     std::shared_ptr<libp2p::event::Bus> event_bus_;
+    std::thread m_thread;
     
 public:
     BitswapContentTest() {
@@ -41,7 +44,7 @@ sinks:
 groups:
   - name: main
     sink: console
-    level: debug
+    level: trace
     children:
       - name: libp2p
       - name: bitswap
@@ -57,22 +60,58 @@ groups:
         auto r = logging_system->configure();
         libp2p::log::setLoggingSystem(logging_system);
         
-        // Create IO context
-        io_context_ = std::make_shared<boost::asio::io_context>();
-        
         // Create event bus
         event_bus_ = std::make_shared<libp2p::event::Bus>();
         
-        // Create host with libp2p injector
-        auto injector = libp2p::injector::makeHostInjector();
+        // Create host with libp2p injector - configure to only use Noise security (no plaintext)
+        auto injector = libp2p::injector::makeHostInjector(
+            libp2p::injector::useSecurityAdaptors<libp2p::security::Noise>()
+        );
         host_ = injector.create<std::shared_ptr<libp2p::Host>>();
         
-        // Create bitswap instance
+        // Get the IO context from the same injector (crucial - must be same as host uses!)
+        io_context_ = injector.create<std::shared_ptr<boost::asio::io_context>>();
+
+        //Config Protocols
+        libp2p::protocol::factory::ProtocolFactory::ProtocolConfig protocol_config;
+        protocol_config.enable_identify = true;
+        protocol_config.enable_autonat = false;
+        protocol_config.enable_relay = false;
+        protocol_config.enable_holepunch_server = false;
+        protocol_config.enable_holepunch_client = false;
+
+        auto protocols = libp2p::protocol::factory::ProtocolFactory::createProtocols(host_, protocol_config, injector);
+        protocols.identify->start();
+        //Bind Listen Address
+        auto bindaddress = (boost::format("/ip4/%s/tcp/%d/p2p/%s") % "0.0.0.0" % "40200" % host_->getId().toBase58()).str();
+
+        std::vector<libp2p::multi::Multiaddress> multiaddresses;
+        auto ma_res = libp2p::multi::Multiaddress::create(bindaddress);
+
+        auto ma = std::move(ma_res.value());
+        boost::optional<libp2p::peer::PeerId> peer_id;
+        auto peer_id_str = ma.getPeerId();
+
+        multiaddresses.push_back(ma);
+        auto peer_id_res = libp2p::peer::PeerId::fromBase58(*peer_id_str);
+        peer_id = peer_id_res.value();
+
+        auto peerInfo = libp2p::peer::PeerInfo{*peer_id, multiaddresses};
+
+        host_->listen(peerInfo.addresses[0]);
+        //Start Host
+        host_->start();
+        // Create bitswap instance and initialize it (registers protocol handler)
         bitswap_ = std::make_shared<Bitswap>(*host_, *event_bus_, io_context_);
+        bitswap_->initialize();  // Call after shared_ptr is constructed to avoid bad_weak_ptr
         
+        m_thread = std::thread([this]() { io_context_->run(); });
+        std::cout << "Libp2p ID" << host_->getId().toBase58() << std::endl;
         std::cout << "✓ Bitswap test environment initialized" << std::endl;
     }
-    
+
+
+
     bool connectToIPFSNode(const std::string& multiaddr_str) {
         std::cout << "\n🔗 Connecting to IPFS node: " << multiaddr_str << std::endl;
         
@@ -84,7 +123,7 @@ groups:
         }
         
         auto multiaddr = multiaddr_result.value();
-        std::cout << "✓ Parsed multiaddress successfully" << std::endl;
+        std::cout << "✓ Parsed multiaddress successfully: " << multiaddr.getStringAddress() << std::endl;
         
         // Extract peer info
         auto peer_id_result = multiaddr.getPeerId();
@@ -101,7 +140,6 @@ groups:
         
         peer_info_ = libp2p::peer::PeerInfo{peer_id.value(), {multiaddr}};
         std::cout << "✓ Extracted peer info - ID: " << peer_info_.value().id.toBase58() << std::endl;
-        
         return true;
     }
     
@@ -142,7 +180,9 @@ groups:
         const auto timeout = std::chrono::seconds(30);
         
         while (!request_completed) {
-            io_context_->poll();
+            // Give the IO context a chance to process events
+            // Even though we have a separate thread, this helps ensure all events are processed
+            io_context_->poll_one();
             
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed > timeout) {
@@ -263,7 +303,7 @@ groups:
         std::cout << "=====================================" << std::endl;
         
         // Test parameters
-        const std::string ipfs_node = "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWHsD2QEUS5FzHEyq2bTuwMSEuEvV86wVAc7VaDDKK1NwJ";
+        const std::string ipfs_node = "/ip4/192.168.46.124/tcp/4001/p2p/12D3KooWHsD2QEUS5FzHEyq2bTuwMSEuEvV86wVAc7VaDDKK1NwJ";
         const std::string test_cid = "QmdHvvEXRUgmyn1q3nkQwf9yE412Vzy5gSuGAukHRLicXA";
         
         // Connect to IPFS node
