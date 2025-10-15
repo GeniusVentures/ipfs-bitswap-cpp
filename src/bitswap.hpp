@@ -8,6 +8,7 @@
 #include <optional>
 #include <map>
 #include <set>
+#include <queue>
 
 #include <libp2p/event/bus.hpp>
 #include <libp2p/protocol/base_protocol.hpp>
@@ -98,6 +99,10 @@ namespace sgns::ipfs_bitswap
         ContentCallback callback;
         std::vector<UnixFSFile> collectedFiles;
         std::set<CID> pendingCIDs;
+        
+        // Request queue for sequential processing
+        std::queue<CID> requestQueue;
+        bool processingQueue = false;
         std::set<CID> completedCIDs;
         
         std::map<CID, FileInProgress> filesInProgress; // CID -> file being assembled
@@ -206,6 +211,7 @@ namespace sgns::ipfs_bitswap
         void handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& basePath = "");
         void checkContentRequestComplete(std::shared_ptr<ContentRequestContext> ctx);
         UnixFSContent assembleContent(std::shared_ptr<ContentRequestContext> ctx);
+        void processRequestQueue(std::shared_ptr<ContentRequestContext> ctx);
 
         libp2p::Host& host_;
         libp2p::event::Bus& bus_;

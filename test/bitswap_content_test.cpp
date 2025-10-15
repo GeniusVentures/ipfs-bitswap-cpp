@@ -21,6 +21,7 @@
 #include <boost/format.hpp>
 
 #include "../src/bitswap.hpp"
+#include "../src/logger.hpp"
 
 using namespace sgns::ipfs_bitswap;
 
@@ -44,7 +45,7 @@ sinks:
 groups:
   - name: main
     sink: console
-    level: trace
+    level: error
     children:
       - name: libp2p
       - name: bitswap
@@ -60,6 +61,8 @@ groups:
         auto r = logging_system->configure();
         libp2p::log::setLoggingSystem(logging_system);
         
+        auto loggerBitswap         = sgns::ipfs_bitswap::createLogger( "Bitswap" );
+        loggerBitswap->set_level( spdlog::level::err );
         // Create event bus
         event_bus_ = std::make_shared<libp2p::event::Bus>();
         
@@ -107,54 +110,80 @@ groups:
         
         m_thread = std::thread([this]() { io_context_->run(); });
         std::cout << "Libp2p ID" << host_->getId().toBase58() << std::endl;
-        std::cout << "✓ Bitswap test environment initialized" << std::endl;
+        std::cout << "[OK] Bitswap test environment initialized" << std::endl;
+    }
+
+    ~BitswapContentTest() {
+        shutdown();
+    }
+
+    void shutdown() {
+        std::cout << "\n[SHUTDOWN] Stopping test environment..." << std::endl;
+        
+        // Stop the host first
+        if (host_) {
+            host_->stop();
+        }
+        
+        // Stop the IO context
+        if (io_context_ && !io_context_->stopped()) {
+            io_context_->stop();
+        }
+        
+        // Wait for the thread to finish
+        if (m_thread.joinable()) {
+            m_thread.join();
+            std::cout << "[OK] IO thread terminated" << std::endl;
+        }
+        
+        std::cout << "[OK] Shutdown complete" << std::endl;
     }
 
 
 
     bool connectToIPFSNode(const std::string& multiaddr_str) {
-        std::cout << "\n🔗 Connecting to IPFS node: " << multiaddr_str << std::endl;
+        std::cout << "\n[CONNECT] Connecting to IPFS node: " << multiaddr_str << std::endl;
         
         // Parse the multiaddress
         auto multiaddr_result = libp2p::multi::Multiaddress::create(multiaddr_str);
         if (!multiaddr_result) {
-            std::cerr << "❌ Failed to parse multiaddress: " << multiaddr_result.error().message() << std::endl;
+            std::cerr << "[ERROR] Failed to parse multiaddress: " << multiaddr_result.error().message() << std::endl;
             return false;
         }
         
         auto multiaddr = multiaddr_result.value();
-        std::cout << "✓ Parsed multiaddress successfully: " << multiaddr.getStringAddress() << std::endl;
+        std::cout << "[OK] Parsed multiaddress successfully: " << multiaddr.getStringAddress() << std::endl;
         
         // Extract peer info
         auto peer_id_result = multiaddr.getPeerId();
         if (!peer_id_result) {
-            std::cerr << "❌ Failed to extract peer ID from multiaddress" << std::endl;
+            std::cerr << "[ERROR] Failed to extract peer ID from multiaddress" << std::endl;
             return false;
         }
         
         auto peer_id = libp2p::peer::PeerId::fromBase58(peer_id_result.value());
         if (!peer_id) {
-            std::cerr << "❌ Failed to parse peer ID: " << peer_id.error().message() << std::endl;
+            std::cerr << "[ERROR] Failed to parse peer ID: " << peer_id.error().message() << std::endl;
             return false;
         }
         
         peer_info_ = libp2p::peer::PeerInfo{peer_id.value(), {multiaddr}};
-        std::cout << "✓ Extracted peer info - ID: " << peer_info_.value().id.toBase58() << std::endl;
+        std::cout << "[OK] Extracted peer info - ID: " << peer_info_.value().id.toBase58() << std::endl;
         return true;
     }
     
     void testContentRetrieval(const std::string& cid_str) {
-        std::cout << "\n📥 Testing content retrieval for CID: " << cid_str << std::endl;
+        std::cout << "\n[RETRIEVE] Testing content retrieval for CID: " << cid_str << std::endl;
         
         // Parse the CID
         auto cid_result = libp2p::multi::ContentIdentifierCodec::fromString(cid_str);
         if (!cid_result) {
-            std::cerr << "❌ Failed to parse CID: " << cid_result.error().message() << std::endl;
+            std::cerr << "[ERROR] Failed to parse CID: " << cid_result.error().message() << std::endl;
             return;
         }
         
         auto cid = cid_result.value();
-        std::cout << "✓ Parsed CID successfully" << std::endl;
+        std::cout << "[OK] Parsed CID successfully" << std::endl;
         
         // Set up completion tracking
         bool request_completed = false;
@@ -162,22 +191,22 @@ groups:
         UnixFSContent retrieved_content;
         
         // Request content using our enhanced API
-        std::cout << "🚀 Starting content request..." << std::endl;
+        std::cout << "[START] Starting content request..." << std::endl;
         
         bitswap_->RequestContent(peer_info_.value(), cid, [&](libp2p::outcome::result<UnixFSContent> result) {
             if (!result) {
                 error_message = result.error().message();
-                std::cerr << "❌ Content request failed: " << error_message << std::endl;
+                std::cerr << "[ERROR] Content request failed: " << error_message << std::endl;
             } else {
                 retrieved_content = std::move(result.value());
-                std::cout << "✅ Content request completed successfully!" << std::endl;
+                std::cout << "[SUCCESS] Content request completed successfully!" << std::endl;
             }
             request_completed = true;
         });
         
         // Run the event loop with timeout
         auto start_time = std::chrono::steady_clock::now();
-        const auto timeout = std::chrono::seconds(30);
+        const auto timeout = std::chrono::seconds(130);
         
         while (!request_completed) {
             // Give the IO context a chance to process events
@@ -186,7 +215,7 @@ groups:
             
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed > timeout) {
-                std::cerr << "❌ Request timed out after 30 seconds" << std::endl;
+                std::cerr << "[TIMEOUT] Request timed out after 30 seconds" << std::endl;
                 return;
             }
             
@@ -195,15 +224,19 @@ groups:
         
         // Display results
         if (!error_message.empty()) {
-            std::cerr << "\n💥 Request failed with error: " << error_message << std::endl;
+            std::cerr << "\n[FAILED] Request failed with error: " << error_message << std::endl;
             return;
         }
+        
+        // Wait a bit longer to ensure all background processing completes
+        std::cout << "\n[WAIT] Ensuring all content processing is complete..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         
         displayContentResults(retrieved_content);
     }
     
     void displayContentResults(const UnixFSContent& content) {
-        std::cout << "\n📋 Content Analysis Results:" << std::endl;
+        std::cout << "\n[RESULTS] Content Analysis Results:" << std::endl;
         std::cout << "==============================" << std::endl;
         
         // Display content type
@@ -219,39 +252,53 @@ groups:
                 type_str = "Multi-File Archive";
                 break;
         }
-        std::cout << "📂 Content Type: " << type_str << std::endl;
-        std::cout << "📄 Total Files: " << content.files.size() << std::endl;
+        std::cout << "[FILE] Content Type: " << type_str << std::endl;
+        std::cout << "[COUNT] Total Files: " << content.files.size() << std::endl;
         
         // Display metadata
         if (!content.metadata.empty()) {
-            std::cout << "\n🏷️  Metadata:" << std::endl;
+            std::cout << "\n[META] Metadata:" << std::endl;
             for (const auto& [key, value] : content.metadata) {
                 std::cout << "   " << key << ": " << value << std::endl;
             }
         }
         
-        // Display files
-        std::cout << "\n📁 Files Retrieved:" << std::endl;
+        // Display files with comprehensive information
+        std::cout << "\n[FILES] Files Retrieved:" << std::endl;
         size_t total_size = 0;
+        int file_count = 0;
+        int dir_count = 0;
         
         for (size_t i = 0; i < content.files.size(); ++i) {
             const auto& file = content.files[i];
-            std::cout << "\n  [" << (i + 1) << "] ";
+            
+            // Determine if this is a directory or file
+            bool is_directory = file.content.empty() && !file.path.empty() && file.path.back() == '/';
+            if (is_directory) {
+                dir_count++;
+                std::cout << "\n  [DIR " << dir_count << "] ";
+            } else {
+                file_count++;
+                std::cout << "\n  [FILE " << file_count << "] ";
+            }
             
             if (file.path.empty()) {
-                std::cout << "(root file)";
+                std::cout << "(root content)";
             } else {
                 std::cout << file.path;
             }
             
             std::cout << std::endl;
-            std::cout << "      Size: " << file.content.size() << " bytes";
             
-            if (file.size != file.content.size()) {
-                std::cout << " (declared: " << file.size << ")";
+            if (!is_directory) {
+                std::cout << "      Size: " << file.content.size() << " bytes";
+                total_size += file.content.size();
+                
+                if (file.size != file.content.size()) {
+                    std::cout << " (declared: " << file.size << ")";
+                }
+                std::cout << std::endl;
             }
-            
-            std::cout << std::endl;
             
             if (file.mode) {
                 std::cout << "      Mode: 0" << std::oct << file.mode.value() << std::dec << std::endl;
@@ -265,8 +312,8 @@ groups:
                 std::cout << std::endl;
             }
             
-            // Show content preview for small files
-            if (file.content.size() <= 200) {
+            // Show content preview for small non-directory files
+            if (!is_directory && file.content.size() > 0 && file.content.size() <= 200) {
                 std::cout << "      Preview: ";
                 bool is_binary = false;
                 for (char c : file.content) {
@@ -286,20 +333,43 @@ groups:
                     std::cout << "\"" << preview << "\"" << std::endl;
                 }
             }
-            
-            total_size += file.content.size();
         }
         
-        std::cout << "\n📊 Summary:" << std::endl;
-        std::cout << "   Total content size: " << total_size << " bytes" << std::endl;
-        std::cout << "   Files processed: " << content.files.size() << std::endl;
-        std::cout << "   Content type: " << type_str << std::endl;
+        std::cout << "\n[SUMMARY] Download Summary:" << std::endl;
+        std::cout << "==============================" << std::endl;
+        std::cout << "[STATS] Files downloaded: " << file_count << std::endl;
+        std::cout << "[STATS] Directories found: " << dir_count << std::endl;
+        std::cout << "[STATS] Total content size: " << total_size << " bytes";
         
-        std::cout << "\n✅ Content retrieval test completed successfully!" << std::endl;
+        // Convert to human-readable format
+        if (total_size > 1024 * 1024) {
+            std::cout << " (" << std::fixed << std::setprecision(2) << (total_size / (1024.0 * 1024.0)) << " MB)";
+        } else if (total_size > 1024) {
+            std::cout << " (" << std::fixed << std::setprecision(2) << (total_size / 1024.0) << " KB)";
+        }
+        std::cout << std::endl;
+        
+        // Show directory structure if we have multiple files
+        if (content.files.size() > 1 && dir_count > 0) {
+            std::cout << "\n[STRUCTURE] Directory Structure:" << std::endl;
+            for (const auto& file : content.files) {
+                if (!file.path.empty()) {
+                    std::cout << "  " << file.path;
+                    if (file.content.empty() && file.path.back() == '/') {
+                        std::cout << " [DIR]";
+                    } else {
+                        std::cout << " (" << file.content.size() << " bytes)";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+        }
+        
+        std::cout << "\n[SUCCESS] Content retrieval test completed successfully!" << std::endl;
     }
     
     void run() {
-        std::cout << "🧪 IPFS Bitswap Content Retrieval Test" << std::endl;
+        std::cout << "[TEST] IPFS Bitswap Content Retrieval Test" << std::endl;
         std::cout << "=====================================" << std::endl;
         
         // Test parameters
@@ -308,14 +378,14 @@ groups:
         
         // Connect to IPFS node
         if (!connectToIPFSNode(ipfs_node)) {
-            std::cerr << "❌ Failed to connect to IPFS node" << std::endl;
+            std::cerr << "[ERROR] Failed to connect to IPFS node" << std::endl;
             return;
         }
         
         // Test content retrieval
         testContentRetrieval(test_cid);
         
-        std::cout << "\n🏁 Test execution completed." << std::endl;
+        std::cout << "\n[COMPLETE] Test execution completed." << std::endl;
     }
     
 private:
@@ -326,12 +396,18 @@ int main() {
     try {
         BitswapContentTest test;
         test.run();
+        
+        // Add a small delay to let any remaining downloads complete
+        std::cout << "\n[WAIT] Waiting for any remaining operations to complete..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        
+        test.shutdown(); // Explicit shutdown before destructor
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "💥 Test failed with exception: " << e.what() << std::endl;
+        std::cerr << "[FAILED] Test failed with exception: " << e.what() << std::endl;
         return 1;
     } catch (...) {
-        std::cerr << "💥 Test failed with unknown exception" << std::endl;
+        std::cerr << "[FAILED] Test failed with unknown exception" << std::endl;
         return 1;
     }
 }
