@@ -9,6 +9,7 @@
 #include <map>
 #include <set>
 #include <queue>
+#include <chrono>
 
 #include <libp2p/event/bus.hpp>
 #include <libp2p/protocol/base_protocol.hpp>
@@ -45,6 +46,26 @@ namespace sgns::ipfs_bitswap
     };
 
     typedef std::function<void(libp2p::outcome::result<UnixFSContent>)> ContentCallback;
+    typedef std::function<void(libp2p::outcome::result<CID>)> PublishCallback;
+
+    // Structure for storing blocks in the local block store
+    struct StoredBlock {
+        std::string data;           // Raw block data
+        CID cid;                   // Block's content identifier
+        std::optional<std::string> filePath; // Original file path (if from file)
+        size_t size;
+        std::chrono::steady_clock::time_point addedTime;
+    };
+
+    // Structure for tracking published content
+    struct PublishedContent {
+        std::string rootPath;      // Root directory or file path
+        CID rootCID;              // Root CID of the content
+        std::map<CID, StoredBlock> blocks; // All blocks that make up this content
+        UnixFSContent::ContentType contentType;
+        size_t totalSize;
+        std::chrono::steady_clock::time_point publishedTime;
+    };
 
     enum class BitswapError
     {
@@ -53,7 +74,10 @@ namespace sgns::ipfs_bitswap
         REQUEST_TIMEOUT,
         INVALID_UNIXFS_DATA,
         IPLD_DECODE_FAILURE,
-        CONTENT_REQUEST_TIMEOUT
+        CONTENT_REQUEST_TIMEOUT,
+        FILE_NOT_FOUND,
+        ENCODING_FAILURE,
+        BLOCK_NOT_FOUND
     };
 
     class BitswapRequestContext
@@ -194,6 +218,60 @@ namespace sgns::ipfs_bitswap
             const libp2p::peer::PeerInfo& pi,
             const CID& cid,
             ContentCallback onContentCallback);
+
+        /**
+        * Publishes a single file to the bitswap network
+        * @param filePath - path to the file to publish
+        * @param onPublishCallback - callback with root CID when publishing is complete
+        */
+        void PublishFile(
+            const std::string& filePath,
+            PublishCallback onPublishCallback);
+
+        /**
+        * Publishes a directory and its contents to the bitswap network
+        * @param directoryPath - path to the directory to publish
+        * @param onPublishCallback - callback with root CID when publishing is complete
+        */
+        void PublishDirectory(
+            const std::string& directoryPath,
+            PublishCallback onPublishCallback);
+
+        /**
+        * Publishes raw data as a block to the bitswap network
+        * @param data - raw data to publish
+        * @param onPublishCallback - callback with CID when publishing is complete
+        */
+        void PublishData(
+            const std::vector<uint8_t>& data,
+            PublishCallback onPublishCallback);
+
+        /**
+        * Checks if a block with the given CID is available locally
+        * @param cid - content identifier to check
+        * @return true if block is available locally
+        */
+        bool HasBlock(const CID& cid) const;
+
+        /**
+        * Gets a block from local storage
+        * @param cid - content identifier
+        * @return block data if found, error otherwise
+        */
+        libp2p::outcome::result<std::string> GetBlock(const CID& cid) const;
+
+        /**
+        * Removes published content from the local store
+        * @param rootCid - root CID of content to unpublish
+        * @return true if content was found and removed
+        */
+        bool UnpublishContent(const CID& rootCid);
+
+        /**
+        * Lists all published content
+        * @return vector of published content info
+        */
+        std::vector<PublishedContent> ListPublishedContent() const;
     private:
         /**
         * Handler for new connections, established by or with our host
@@ -248,7 +326,25 @@ namespace sgns::ipfs_bitswap
         mutable std::mutex mutexActiveStreams_;
         std::map<libp2p::peer::PeerId, std::shared_ptr<libp2p::connection::Stream>> activeStreams_;
 
+        // Server-side storage for published content
+        mutable std::mutex mutexBlockStore_;
+        std::map<CID, StoredBlock> blockStore_;  // CID -> block data
+        std::map<CID, PublishedContent> publishedContent_; // Root CID -> published content info
+
         Logger logger_ = createLogger("Bitswap");
+
+    private:
+        // Server-side encoding and storage methods
+        CID encodeAndStoreFile(const std::string& filePath);
+        CID encodeChunkedFile(const std::vector<uint8_t>& content, const std::string& filePath);
+        CID encodeAndStoreDirectory(const std::string& directoryPath);
+        CID encodeAndStoreData(const std::vector<uint8_t>& data, unixfs_pb::Data::DataType type = unixfs_pb::Data::Raw);
+        std::vector<uint8_t> createUnixFSData(const std::vector<uint8_t>& content, unixfs_pb::Data::DataType type, 
+                                              uint64_t filesize = 0, const std::vector<CID>& links = {});
+        CID createIPLDNode(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links = {});
+        void storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath = "");
+        void handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream);
+        void sendBlockResponse(const CID& cid, const std::string& blockData, std::shared_ptr<libp2p::connection::Stream> stream);
     };
 }  // ipfs_bitswap
 
