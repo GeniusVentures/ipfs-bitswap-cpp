@@ -175,6 +175,15 @@ namespace sgns::ipfs_bitswap
             BlockCallback onBlockCallback);
 
         /**
+        * Internal retry logic for RequestBlock
+        */
+        void RequestBlockWithRetry(
+            const libp2p::peer::PeerInfo& pi,
+            const CID& cid,
+            BlockCallback onBlockCallback,
+            int retryCount);
+
+        /**
         * Requests complete UnixFS content from a remote peer
         * Automatically handles tree traversal, chunk reassembly, and directory structures
         * @param pi - remote peer info

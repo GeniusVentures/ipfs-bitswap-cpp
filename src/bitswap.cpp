@@ -320,6 +320,18 @@ namespace sgns::ipfs_bitswap {
         const CID& cid,
         BlockCallback onBlockCallback)
     {
+        RequestBlockWithRetry(pi, cid, std::move(onBlockCallback), 0);
+    }
+
+    void Bitswap::RequestBlockWithRetry(
+        const libp2p::peer::PeerInfo& pi,
+        const CID& cid,
+        BlockCallback onBlockCallback,
+        int retryCount)
+    {
+        const int maxRetries = 2;
+        const int baseDelayMs = 500;
+        
         // Check if connectable
         auto connectedness = host_.connectedness(pi);
         if (connectedness == libp2p::Host::Connectedness::CAN_NOT_CONNECT)
@@ -345,11 +357,17 @@ namespace sgns::ipfs_bitswap {
         }
 
         // No active stream, create a new one
-        logger_->debug("Creating new stream for peer {}", pi.id.toBase58());
+        if (retryCount > 0) {
+            logger_->warn("Retrying stream creation for peer {} (attempt {}/{})", 
+                         pi.id.toBase58(), retryCount + 1, maxRetries + 1);
+        } else {
+            logger_->debug("Creating new stream for peer {}", pi.id.toBase58());
+        }
+        
         host_.newStream(
             pi,
             bitswapProtocolId,
-            [wp = weak_from_this(), cid(cid), pi(pi), onBlockCallback = std::move(onBlockCallback)]
+            [wp = weak_from_this(), cid(cid), pi(pi), onBlockCallback = std::move(onBlockCallback), retryCount, maxRetries, baseDelayMs]
                 (libp2p::protocol::BaseProtocol::StreamResult rstream) mutable
             {
                 auto ctx = wp.lock();
@@ -357,12 +375,40 @@ namespace sgns::ipfs_bitswap {
                 {
                     if (!rstream)
                     {
-                        ctx->logger_->error("no new outbound stream created to peer {}", pi.id.toBase58());
-                        onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+                        ctx->logger_->error("Failed to create stream to peer {} (attempt {}): {}", 
+                                           pi.id.toBase58(), retryCount + 1, rstream.error().message());
+                        
+                        // Clear any stale cached streams for this peer
+                        {
+                            std::lock_guard<std::mutex> guard(ctx->mutexActiveStreams_);
+                            ctx->activeStreams_.erase(pi.id);
+                        }
+                        
+                        if (retryCount < maxRetries) {
+                            // Retry with exponential backoff
+                            int delay = baseDelayMs * (1 << retryCount); // 500ms, 1000ms, 2000ms
+                            auto timer = std::make_shared<boost::asio::deadline_timer>(*ctx->context_);
+                            timer->expires_from_now(boost::posix_time::milliseconds(delay));
+                            timer->async_wait([ctx, pi, cid, onBlockCallback = std::move(onBlockCallback), retryCount, timer]
+                                            (const boost::system::error_code& ec) mutable {
+                                if (!ec) {
+                                    ctx->RequestBlockWithRetry(pi, cid, std::move(onBlockCallback), retryCount + 1);
+                                } else {
+                                    onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+                                }
+                            });
+                        } else {
+                            ctx->logger_->error("All retry attempts failed for peer {}", pi.id.toBase58());
+                            onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+                        }
                     }
                     else
                     {
                         auto stream = rstream.value();
+                        if (retryCount > 0) {
+                            ctx->logger_->info("Stream creation succeeded on retry {} for peer {}", 
+                                             retryCount + 1, pi.id.toBase58());
+                        }
                         ctx->logStreamState("outbound stream created", *stream);
                         
                         // Cache the stream for reuse
@@ -375,8 +421,9 @@ namespace sgns::ipfs_bitswap {
                     }
                 }
             },
-            std::chrono::milliseconds(5000));
+            std::chrono::milliseconds(5000)); // Back to 5s timeout
     }
+    
 
     void Bitswap::logStreamState(const std::string_view& message, libp2p::connection::Stream& stream)
     {
