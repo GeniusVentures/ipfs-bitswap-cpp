@@ -13,9 +13,12 @@
 #include <libp2p/multi/content_identifier_codec.hpp>
 #include <libp2p/multi/multiaddress.hpp>
 #include <libp2p/peer/peer_info.hpp>
+#include <libp2p/log/configurator.hpp>
+#include <libp2p/log/logger.hpp>
+#include <soralog/logging_system.hpp>
+#include <soralog/impl/configurator_from_yaml.hpp>
 
 #include "../src/bitswap.hpp"
-#include "../src/logger.hpp"
 
 using namespace sgns::ipfs_bitswap;
 
@@ -28,6 +31,32 @@ private:
     
 public:
     BitswapContentTest() {
+        // Initialize logging system
+        const std::string logger_config(R"(
+# ----------------
+sinks:
+  - name: console
+    type: console
+    color: false
+groups:
+  - name: main
+    sink: console
+    level: debug
+    children:
+      - name: libp2p
+      - name: bitswap
+# ----------------
+        )");
+
+        auto logging_system = std::make_shared<soralog::LoggingSystem>(
+            std::make_shared<soralog::ConfiguratorFromYAML>(
+                // Original LibP2P logging config
+                std::make_shared<libp2p::log::Configurator>(),
+                // Additional logging config for application
+                logger_config));
+        auto r = logging_system->configure();
+        libp2p::log::setLoggingSystem(logging_system);
+        
         // Create IO context
         io_context_ = std::make_shared<boost::asio::io_context>();
         
