@@ -3,7 +3,7 @@
 #include <thread>
 #include <chrono>
 #include <boost/asio/io_context.hpp>
-#include <libp2p/host/basic/basic_host.hpp>
+#include <libp2p/host/basic_host.hpp>
 #include <libp2p/security/noise.hpp>
 #include <libp2p/transport/tcp.hpp>
 #include <libp2p/muxer/yamux.hpp>
@@ -28,9 +28,6 @@ private:
     
 public:
     BitswapContentTest() {
-        // Initialize logging
-        initBitswapLogger();
-        
         // Create IO context
         io_context_ = std::make_shared<boost::asio::io_context>();
         
@@ -61,14 +58,20 @@ public:
         std::cout << "✓ Parsed multiaddress successfully" << std::endl;
         
         // Extract peer info
-        auto peer_info_result = libp2p::peer::PeerInfo::create(multiaddr);
-        if (!peer_info_result) {
-            std::cerr << "❌ Failed to create peer info: " << peer_info_result.error().message() << std::endl;
+        auto peer_id_result = multiaddr.getPeerId();
+        if (!peer_id_result) {
+            std::cerr << "❌ Failed to extract peer ID from multiaddress" << std::endl;
             return false;
         }
         
-        peer_info_ = peer_info_result.value();
-        std::cout << "✓ Extracted peer info - ID: " << peer_info_.id.toBase58() << std::endl;
+        auto peer_id = libp2p::peer::PeerId::fromBase58(peer_id_result.value());
+        if (!peer_id) {
+            std::cerr << "❌ Failed to parse peer ID: " << peer_id.error().message() << std::endl;
+            return false;
+        }
+        
+        peer_info_ = libp2p::peer::PeerInfo{peer_id.value(), {multiaddr}};
+        std::cout << "✓ Extracted peer info - ID: " << peer_info_.value().id.toBase58() << std::endl;
         
         return true;
     }
@@ -94,7 +97,7 @@ public:
         // Request content using our enhanced API
         std::cout << "🚀 Starting content request..." << std::endl;
         
-        bitswap_->RequestContent(peer_info_, cid, [&](libp2p::outcome::result<UnixFSContent> result) {
+        bitswap_->RequestContent(peer_info_.value(), cid, [&](libp2p::outcome::result<UnixFSContent> result) {
             if (!result) {
                 error_message = result.error().message();
                 std::cerr << "❌ Content request failed: " << error_message << std::endl;
@@ -186,7 +189,11 @@ public:
             }
             
             if (file.mtime) {
-                std::cout << "      Modified: " << file.mtime->seconds() << "." << file.mtime->fractional_nanoseconds() << std::endl;
+                std::cout << "      Modified: " << file.mtime->seconds();
+                if (file.mtime->has_fractionalnanoseconds()) {
+                    std::cout << "." << file.mtime->fractionalnanoseconds();
+                }
+                std::cout << std::endl;
             }
             
             // Show content preview for small files
@@ -243,7 +250,7 @@ public:
     }
     
 private:
-    libp2p::peer::PeerInfo peer_info_;
+    std::optional<libp2p::peer::PeerInfo> peer_info_;
 };
 
 int main() {

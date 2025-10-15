@@ -80,8 +80,8 @@ namespace sgns::ipfs_bitswap
         // Enhanced chunk tracking
         struct FileChunk {
             std::vector<char> data;
-            size_t index;
-            CID cid;
+            size_t index = 0;
+            std::optional<CID> cid;
         };
         
         struct FileInProgress {
@@ -94,7 +94,7 @@ namespace sgns::ipfs_bitswap
         };
 
         CID rootCID;
-        libp2p::peer::PeerInfo peerInfo;  // Store peer info for additional requests
+        std::optional<libp2p::peer::PeerInfo> peerInfo;  // Store peer info for additional requests
         ContentCallback callback;
         std::vector<UnixFSFile> collectedFiles;
         std::set<CID> pendingCIDs;
@@ -105,9 +105,9 @@ namespace sgns::ipfs_bitswap
         
         boost::asio::deadline_timer timeout;
         bool timedOut = false;
+        boost::posix_time::time_duration contentTimeout_;
 
     private:
-        boost::posix_time::time_duration contentTimeout_;
     };
     /**
     * /bitswap/1.0.0 protocol implementation

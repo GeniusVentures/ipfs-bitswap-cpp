@@ -25,9 +25,6 @@ target_link_libraries(bitswap_content_test
     p2p::p2p_identify_proto
     p2p::p2p_default_host
     p2p::p2p_default_network
-    p2p::p2p_security_noise
-    p2p::p2p_transport_tcp
-    p2p::p2p_muxer_yamux
     ipfs-lite-cpp::ipld_node
     ${WIN_CRYPT_LIBRARY}
     ${Boost_LIBRARIES}

@@ -406,7 +406,7 @@ namespace sgns::ipfs_bitswap {
                 logger_->debug("Found linked CID: {}, requesting...", libp2p::multi::ContentIdentifierCodec::toString(subcid.value()).value());
                 
                 // Request the linked CID
-                RequestBlock(ctx->peerInfo, subcid.value(), [this, ctx, subcid](libp2p::outcome::result<std::string> linkResult) {
+                RequestBlock(ctx->peerInfo.value(), subcid.value(), [this, ctx, subcid](libp2p::outcome::result<std::string> linkResult) {
                     if (!linkResult) {
                         if (!ctx->timedOut) {
                             ctx->callback(linkResult.error());
@@ -443,7 +443,7 @@ namespace sgns::ipfs_bitswap {
                 break;
                 
             default:
-                logger_->warn("Unsupported UnixFS data type: {}", unixfsData.type());
+                //logger_->warn("Unsupported UnixFS data type: {}", unixfsData.type());
                 // For now, treat as raw data
                 handleFileBlock(ctx, cid, unixfsData, decoder, path);
                 break;
@@ -478,7 +478,7 @@ namespace sgns::ipfs_bitswap {
             // This file has multiple chunks - set up for chunk assembly
             logger_->debug("Multi-chunk file detected: {} with {} chunks", filePath, decoder.getLinksCount());
             
-            FileInProgress& fileProgress = ctx->filesInProgress[cid];
+            ContentRequestContext::FileInProgress& fileProgress = ctx->filesInProgress[cid];
             fileProgress.path = filePath;
             fileProgress.expectedChunks = decoder.getLinksCount();
             fileProgress.totalSize = unixfsData.has_filesize() ? unixfsData.filesize() : 0;
@@ -492,18 +492,19 @@ namespace sgns::ipfs_bitswap {
             
             // If there's immediate data in the root block, store it as chunk 0
             if (unixfsData.has_data()) {
-                FileChunk chunk;
-                chunk.data = std::vector<char>(unixfsData.data().begin(), unixfsData.data().end());
-                chunk.index = 0;
-                chunk.cid = cid;
+                ContentRequestContext::FileChunk chunk{
+                    std::vector<char>(unixfsData.data().begin(), unixfsData.data().end()),
+                    0,
+                    std::make_optional(cid)
+                };
                 fileProgress.chunks[0] = std::move(chunk);
                 logger_->debug("Stored root chunk 0 ({} bytes)", chunk.data.size());
             }
             
             // Request all linked chunks
             for (size_t i = 0; i < decoder.getLinksCount(); ++i) {
-                auto linkCidData = decoder.getLinkCid(i);
-                auto linkCid = libp2p::multi::ContentIdentifierCodec::fromBytes(
+                auto linkCidData = decoder.getLinkCID(i);
+                auto linkCid = libp2p::multi::ContentIdentifierCodec::decode(
                     gsl::span((uint8_t*)linkCidData.data(), linkCidData.size()));
                 
                 if (linkCid && ctx->completedCIDs.find(linkCid.value()) == ctx->completedCIDs.end()) {
@@ -512,7 +513,8 @@ namespace sgns::ipfs_bitswap {
                     
                     logger_->debug("Requesting file chunk {} for {}", i + 1, filePath);
                     
-                    RequestBlock(ctx->peerInfo, linkCid.value(), [this, ctx, linkCid, chunkIndex = i + 1, parentCid = cid](libp2p::outcome::result<std::string> chunkResult) {
+                    auto cidValue = linkCid.value(); // Extract the CID value
+                    RequestBlock(ctx->peerInfo.value(), cidValue, [this, ctx, cidValue, chunkIndex = i + 1, parentCid = cid](libp2p::outcome::result<std::string> chunkResult) {
                         if (!chunkResult) {
                             if (!ctx->timedOut) {
                                 ctx->callback(chunkResult.error());
@@ -521,7 +523,7 @@ namespace sgns::ipfs_bitswap {
                             }
                             return;
                         }
-                        handleFileChunk(ctx, linkCid.value(), chunkResult.value(), chunkIndex, parentCid);
+                        handleFileChunk(ctx, cidValue, chunkResult.value(), chunkIndex, parentCid);
                     });
                 }
             }
@@ -569,10 +571,11 @@ namespace sgns::ipfs_bitswap {
         }
         
         // Store the chunk
-        ContentRequestContext::FileChunk chunk;
-        chunk.data = std::move(chunkContent);
-        chunk.index = chunkIndex;
-        chunk.cid = chunkCid;
+        ContentRequestContext::FileChunk chunk{
+            std::move(chunkContent),
+            chunkIndex,
+            std::make_optional(chunkCid)
+        };
         fileProgress.chunks[chunkIndex] = std::move(chunk);
         
         logger_->debug("Stored chunk {} for file {} ({}/{} chunks)", 
@@ -630,7 +633,7 @@ namespace sgns::ipfs_bitswap {
         // Directory blocks contain links to their contents
         for (size_t i = 0; i < decoder.getLinksCount(); ++i) {
             auto linkName = decoder.getLinkName(i);
-            auto linkCidData = decoder.getLinkCid(i);
+            auto linkCidData = decoder.getLinkCID(i);
             auto linkSize = decoder.getLinkSize(i);
             
             if (linkName.empty()) {
@@ -642,7 +645,7 @@ namespace sgns::ipfs_bitswap {
             std::string childPath = basePath.empty() ? linkName : basePath + "/" + linkName;
             
             // Parse the linked CID
-            auto linkCid = libp2p::multi::ContentIdentifierCodec::fromBytes(
+            auto linkCid = libp2p::multi::ContentIdentifierCodec::decode(
                 gsl::span((uint8_t*)linkCidData.data(), linkCidData.size()));
             
             if (!linkCid) {
@@ -664,7 +667,8 @@ namespace sgns::ipfs_bitswap {
                           libp2p::multi::ContentIdentifierCodec::toString(linkCid.value()).value());
             
             // Request the linked content
-            RequestBlock(ctx->peerInfo, linkCid.value(), [this, ctx, linkCid, childPath](libp2p::outcome::result<std::string> entryResult) {
+            auto cidValue = linkCid.value(); // Extract the CID value
+            RequestBlock(ctx->peerInfo.value(), cidValue, [this, ctx, cidValue, childPath](libp2p::outcome::result<std::string> entryResult) {
                 if (!entryResult) {
                     if (!ctx->timedOut) {
                         logger_->error("Failed to fetch directory entry {}: {}", childPath, entryResult.error().message());
@@ -676,7 +680,7 @@ namespace sgns::ipfs_bitswap {
                 }
                 
                 // Process the entry with the proper path
-                processUnixFSBlock(ctx, linkCid.value(), entryResult.value(), childPath);
+                processUnixFSBlock(ctx, cidValue, entryResult.value(), childPath);
             });
         }
         
