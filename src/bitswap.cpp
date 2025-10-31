@@ -47,6 +47,12 @@ OUTCOME_CPP_DEFINE_CATEGORY_3(sgns::ipfs_bitswap, BitswapError, e)
 namespace
 {
     const std::string bitswapProtocolId = "/ipfs/bitswap/1.0.0";
+    
+    // Helper function to safely convert CID to string
+    std::string cidToString(const libp2p::multi::ContentIdentifier& cid) {
+        auto result = libp2p::multi::ContentIdentifierCodec::toString(cid);
+        return result.has_value() ? result.value() : "invalid";
+    }
 }  // namespace
 
 namespace sgns::ipfs_bitswap {
@@ -131,7 +137,7 @@ namespace sgns::ipfs_bitswap {
         {
             auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
             rw->read<bitswap_pb::Message>(
-                [ctx = shared_from_this()](libp2p::outcome::result<bitswap_pb::Message> rmsg) {
+                [ctx = shared_from_this(), stream](libp2p::outcome::result<bitswap_pb::Message> rmsg) {
                     if (!rmsg)
                     {
                         ctx->logger_->error("bitswap message cannot be decoded");
@@ -942,13 +948,13 @@ namespace sgns::ipfs_bitswap {
         
         if (!fs::exists(filePath) || !fs::is_regular_file(filePath)) {
             logger_->error("File not found or not a regular file: {}", filePath);
-            return CID{}; // Invalid CID 
+            throw std::runtime_error("File not found: " + filePath);
         }
 
         std::ifstream file(filePath, std::ios::binary);
         if (!file) {
             logger_->error("Failed to open file: {}", filePath);
-            return CID{};
+            throw std::runtime_error("Failed to open file: " + filePath);
         }
 
         // Read file content
@@ -989,7 +995,7 @@ namespace sgns::ipfs_bitswap {
             CID chunkCID = encodeAndStoreData(chunk, unixfs_pb::Data::Raw);
             if (chunkCID.content_address.toBuffer().empty()) {
                 logger_->error("Failed to encode chunk for file: {}", filePath);
-                return CID{};
+                throw std::runtime_error("Failed to encode chunk for file: " + filePath);
             }
             
             chunkCIDs.push_back(chunkCID);
@@ -1010,13 +1016,13 @@ namespace sgns::ipfs_bitswap {
         std::string serializedUnixFS;
         if (!unixfsData.SerializeToString(&serializedUnixFS)) {
             logger_->error("Failed to serialize UnixFS data for chunked file: {}", filePath);
-            return CID{};
+            throw std::runtime_error("Failed to serialize UnixFS data for chunked file: " + filePath);
         }
 
         // Create IPLD links to chunks
         std::map<std::string, CID> links;
         for (size_t i = 0; i < chunkCIDs.size(); ++i) {
-            links[std::to_string(i)] = chunkCIDs[i];
+            links.emplace(std::to_string(i), chunkCIDs[i]);
         }
 
         // Create root IPLD node
@@ -1024,7 +1030,9 @@ namespace sgns::ipfs_bitswap {
         
         logger_->debug("Created chunked file with {} chunks, root CID: {}", 
                       chunkCIDs.size(), 
-                      libp2p::multi::ContentIdentifierCodec::toString(rootCID).value_or("invalid"));
+                      libp2p::multi::ContentIdentifierCodec::toString(rootCID).has_value() 
+                          ? libp2p::multi::ContentIdentifierCodec::toString(rootCID).value() 
+                          : "invalid");
         
         return rootCID;
     }
@@ -1035,7 +1043,7 @@ namespace sgns::ipfs_bitswap {
         
         if (!fs::exists(directoryPath) || !fs::is_directory(directoryPath)) {
             logger_->error("Directory not found: {}", directoryPath);
-            return CID{};
+            throw std::runtime_error("Directory not found: " + directoryPath);
         }
 
         // Create directory UnixFS data
@@ -1047,21 +1055,26 @@ namespace sgns::ipfs_bitswap {
         // Process directory entries
         for (const auto& entry : fs::directory_iterator(directoryPath)) {
             std::string entryName = entry.path().filename().string();
-            CID entryCID;
             
-            if (entry.is_regular_file()) {
-                entryCID = encodeAndStoreFile(entry.path().string());
-            } else if (entry.is_directory()) {
-                entryCID = encodeAndStoreDirectory(entry.path().string());
-            } else {
-                logger_->warn("Skipping unsupported file type: {}", entry.path().string());
-                continue;
-            }
-
-            if (!entryCID.content_address.toBuffer().empty()) {
-                links[entryName] = entryCID;
-                logger_->debug("Added directory entry: {} -> {}", entryName,
-                              libp2p::multi::ContentIdentifierCodec::toString(entryCID).value_or("invalid"));
+            try {
+                CID entryCID = [&]() -> CID {
+                    if (entry.is_regular_file()) {
+                        return encodeAndStoreFile(entry.path().string());
+                    } else if (entry.is_directory()) {
+                        return encodeAndStoreDirectory(entry.path().string());
+                    } else {
+                        logger_->warn("Skipping unsupported file type: {}", entry.path().string());
+                        throw std::runtime_error("Unsupported file type");
+                    }
+                }();
+                
+                if (!entryCID.content_address.toBuffer().empty()) {
+                    links.emplace(entryName, entryCID);
+                    logger_->debug("Added directory entry: {} -> {}", entryName, cidToString(entryCID));
+                }
+            } catch (const std::exception& e) {
+                logger_->warn("Failed to process directory entry {}: {}", entry.path().string(), e.what());
+                // Continue with other entries
             }
         }
 
@@ -1069,15 +1082,14 @@ namespace sgns::ipfs_bitswap {
         std::string serializedUnixFS;
         if (!unixfsData.SerializeToString(&serializedUnixFS)) {
             logger_->error("Failed to serialize UnixFS data for directory: {}", directoryPath);
-            return CID{};
+            throw std::runtime_error("Failed to serialize UnixFS data for directory: " + directoryPath);
         }
 
         // Create IPLD node
         CID dirCID = createIPLDNode(std::vector<uint8_t>(serializedUnixFS.begin(), serializedUnixFS.end()), links);
         
         logger_->debug("Created directory with {} entries, CID: {}", 
-                      links.size(),
-                      libp2p::multi::ContentIdentifierCodec::toString(dirCID).value_or("invalid"));
+                      links.size(), cidToString(dirCID));
         
         return dirCID;
     }
@@ -1091,8 +1103,7 @@ namespace sgns::ipfs_bitswap {
         CID cid = createIPLDNode(unixfsData);
         
         if (!cid.content_address.toBuffer().empty()) {
-            logger_->debug("Encoded and stored {} bytes as CID: {}", data.size(),
-                          libp2p::multi::ContentIdentifierCodec::toString(cid).value_or("invalid"));
+            logger_->debug("Encoded and stored {} bytes as CID: {}", data.size(), cidToString(cid));
         }
         
         return cid;
@@ -1137,8 +1148,9 @@ namespace sgns::ipfs_bitswap {
         // Convert links to the format expected by the encoder
         std::map<std::string, ipfs_lite::ipld::IPLDLinkImpl> ipldLinks;
         for (const auto& [name, cid] : links) {
-            // We need to determine the size - for now use 0, should be improved
-            ipldLinks[name] = ipfs_lite::ipld::IPLDLinkImpl(cid, 0);
+            // Convert to sgns::CID type and determine the size - for now use 0, should be improved
+            sgns::CID sgnsCid(cid);
+            ipldLinks[name] = ipfs_lite::ipld::IPLDLinkImpl(sgnsCid, name, 0);
         }
         
         // Encode IPLD node
@@ -1153,7 +1165,7 @@ namespace sgns::ipfs_bitswap {
         
         if (cidResult.empty()) {
             logger_->error("Failed to create CID for IPLD node");
-            return CID{};
+            throw std::runtime_error("Failed to create CID for IPLD node");
         }
         
         auto cid = libp2p::multi::ContentIdentifierCodec::decode(
@@ -1162,7 +1174,7 @@ namespace sgns::ipfs_bitswap {
         
         if (!cid) {
             logger_->error("Failed to decode created CID: {}", cid.error().message());
-            return CID{};
+            throw std::runtime_error("Failed to decode created CID: " + cid.error().message());
         }
         
         // Store the block
@@ -1176,21 +1188,17 @@ namespace sgns::ipfs_bitswap {
     {
         std::lock_guard<std::mutex> guard(mutexBlockStore_);
         
-        StoredBlock block;
-        block.data = blockData;
-        block.cid = cid;
-        block.size = blockData.size();
-        block.addedTime = std::chrono::steady_clock::now();
+        StoredBlock block{
+            blockData,
+            cid,
+            originalPath.empty() ? std::nullopt : std::make_optional(originalPath),
+            blockData.size(),
+            std::chrono::steady_clock::now()
+        };
         
-        if (!originalPath.empty()) {
-            block.filePath = originalPath;
-        }
+        blockStore_.emplace(cid, std::move(block));
         
-        blockStore_[cid] = std::move(block);
-        
-        logger_->debug("Stored block: {} ({} bytes)", 
-                      libp2p::multi::ContentIdentifierCodec::toString(cid).value_or("invalid"),
-                      blockData.size());
+        logger_->debug("Stored block: {} ({} bytes)", cidToString(cid), blockData.size());
     }
 
     void Bitswap::handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream)
@@ -1199,14 +1207,12 @@ namespace sgns::ipfs_bitswap {
         
         auto blockIt = blockStore_.find(wantedCid);
         if (blockIt != blockStore_.end()) {
-            logger_->debug("Responding to wantlist request for CID: {}", 
-                          libp2p::multi::ContentIdentifierCodec::toString(wantedCid).value_or("invalid"));
+            logger_->debug("Responding to wantlist request for CID: {}", cidToString(wantedCid));
             
             // Send the block back to the requesting peer
             sendBlockResponse(wantedCid, blockIt->second.data, stream);
         } else {
-            logger_->trace("Block not found for wantlist request: {}", 
-                          libp2p::multi::ContentIdentifierCodec::toString(wantedCid).value_or("invalid"));
+            logger_->trace("Block not found for wantlist request: {}", cidToString(wantedCid));
         }
     }
 
@@ -1216,8 +1222,8 @@ namespace sgns::ipfs_bitswap {
         bitswap_pb::Message pb_msg;
         BitswapMessage msg(pb_msg);
         
-        // Add the block to the message
-        msg.AddBlock(blockData);
+        // Add the block to the message (using protobuf directly since AddBlock method doesn't exist)
+        pb_msg.add_blocks(blockData.data(), blockData.size());
         
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
         rw->write<bitswap_pb::Message>(
@@ -1225,12 +1231,10 @@ namespace sgns::ipfs_bitswap {
             [ctx = shared_from_this(), cid, blockSize = blockData.size()](auto&& writtenBytes) {
                 if (writtenBytes) {
                     ctx->logger_->debug("Successfully sent block response for CID: {} ({} bytes written, {} block size)",
-                                       libp2p::multi::ContentIdentifierCodec::toString(cid).value_or("invalid"),
-                                       writtenBytes.value(), blockSize);
+                                       cidToString(cid), writtenBytes.value(), blockSize);
                 } else {
                     ctx->logger_->error("Failed to send block response for CID: {}, error: {}",
-                                       libp2p::multi::ContentIdentifierCodec::toString(cid).value_or("invalid"),
-                                       writtenBytes.error().message());
+                                       cidToString(cid), writtenBytes.error().message());
                 }
             });
     }
@@ -1253,26 +1257,28 @@ namespace sgns::ipfs_bitswap {
             // Store published content info
             {
                 std::lock_guard<std::mutex> guard(mutexBlockStore_);
-                PublishedContent content;
-                content.rootPath = filePath;
-                content.rootCID = rootCID;
-                content.contentType = UnixFSContent::SINGLE_FILE;
-                content.publishedTime = std::chrono::steady_clock::now();
+                PublishedContent content{
+                    filePath,
+                    rootCID,
+                    {},
+                    UnixFSContent::SINGLE_FILE,
+                    0,
+                    std::chrono::steady_clock::now()
+                };
                 
                 // Collect all blocks that belong to this content
                 // For now, we'll just include the root block, but this should be enhanced
                 // to include all related blocks for chunked files
                 auto blockIt = blockStore_.find(rootCID);
                 if (blockIt != blockStore_.end()) {
-                    content.blocks[rootCID] = blockIt->second;
+                    content.blocks.emplace(rootCID, blockIt->second);
                     content.totalSize = blockIt->second.size;
                 }
                 
-                publishedContent_[rootCID] = std::move(content);
+                publishedContent_.emplace(rootCID, std::move(content));
             }
             
-            logger_->info("Successfully published file: {} with CID: {}", filePath,
-                         libp2p::multi::ContentIdentifierCodec::toString(rootCID).value_or("invalid"));
+            logger_->info("Successfully published file: {} with CID: {}", filePath, cidToString(rootCID));
             
             callback(rootCID);
         }).detach();
@@ -1294,28 +1300,30 @@ namespace sgns::ipfs_bitswap {
             // Store published content info
             {
                 std::lock_guard<std::mutex> guard(mutexBlockStore_);
-                PublishedContent content;
-                content.rootPath = directoryPath;
-                content.rootCID = rootCID;
-                content.contentType = UnixFSContent::DIRECTORY;
-                content.publishedTime = std::chrono::steady_clock::now();
+                PublishedContent content{
+                    directoryPath,
+                    rootCID,
+                    {},
+                    UnixFSContent::DIRECTORY,
+                    0,
+                    std::chrono::steady_clock::now()
+                };
                 
                 // Collect all blocks that belong to this content
                 // This should include all files and subdirectories
                 size_t totalSize = 0;
                 for (const auto& [cid, block] : blockStore_) {
                     if (block.filePath && block.filePath->find(directoryPath) == 0) {
-                        content.blocks[cid] = block;
+                        content.blocks.emplace(cid, block);
                         totalSize += block.size;
                     }
                 }
                 content.totalSize = totalSize;
                 
-                publishedContent_[rootCID] = std::move(content);
+                publishedContent_.emplace(rootCID, std::move(content));
             }
             
-            logger_->info("Successfully published directory: {} with CID: {}", directoryPath,
-                         libp2p::multi::ContentIdentifierCodec::toString(rootCID).value_or("invalid"));
+            logger_->info("Successfully published directory: {} with CID: {}", directoryPath, cidToString(rootCID));
             
             callback(rootCID);
         }).detach();
@@ -1335,23 +1343,25 @@ namespace sgns::ipfs_bitswap {
         // Store published content info
         {
             std::lock_guard<std::mutex> guard(mutexBlockStore_);
-            PublishedContent content;
-            content.rootPath = ""; // No file path for raw data
-            content.rootCID = rootCID;
-            content.contentType = UnixFSContent::SINGLE_FILE;
-            content.publishedTime = std::chrono::steady_clock::now();
+            PublishedContent content{
+                "", // No file path for raw data
+                rootCID,
+                {},
+                UnixFSContent::SINGLE_FILE,
+                0,
+                std::chrono::steady_clock::now()
+            };
             
             auto blockIt = blockStore_.find(rootCID);
             if (blockIt != blockStore_.end()) {
-                content.blocks[rootCID] = blockIt->second;
+                content.blocks.emplace(rootCID, blockIt->second);
                 content.totalSize = blockIt->second.size;
             }
             
-            publishedContent_[rootCID] = std::move(content);
+            publishedContent_.emplace(rootCID, std::move(content));
         }
         
-        logger_->info("Successfully published raw data with CID: {}",
-                     libp2p::multi::ContentIdentifierCodec::toString(rootCID).value_or("invalid"));
+        logger_->info("Successfully published raw data with CID: {}", cidToString(rootCID));
         
         onPublishCallback(rootCID);
     }
@@ -1386,14 +1396,12 @@ namespace sgns::ipfs_bitswap {
         // Remove all blocks associated with this content
         for (const auto& [cid, block] : contentIt->second.blocks) {
             blockStore_.erase(cid);
-            logger_->debug("Removed block: {}", 
-                          libp2p::multi::ContentIdentifierCodec::toString(cid).value_or("invalid"));
+            logger_->debug("Removed block: {}", cidToString(cid));
         }
         
         publishedContent_.erase(contentIt);
         
-        logger_->info("Unpublished content with root CID: {}",
-                     libp2p::multi::ContentIdentifierCodec::toString(rootCid).value_or("invalid"));
+        logger_->info("Unpublished content with root CID: {}", cidToString(rootCid));
         
         return true;
     }
