@@ -2,34 +2,16 @@
 #include <memory>
 #include <thread>
 #include <chrono>
-#include <boost/asio/io_context.hpp>
-#include <libp2p/host/basic_host.hpp>
-#include <libp2p/security/noise.hpp>
-#include <libp2p/transport/tcp.hpp>
-#include <libp2p/muxer/yamux.hpp>
-#include <libp2p/protocol/ping.hpp>
-#include <libp2p/protocol/identify.hpp>
-#include <libp2p/injector/host_injector.hpp>
-#include <libp2p/multi/content_identifier_codec.hpp>
-#include <libp2p/multi/multiaddress.hpp>
-#include <libp2p/peer/peer_info.hpp>
-#include <libp2p/log/configurator.hpp>
-#include <libp2p/log/logger.hpp>
-#include <libp2p/crypto/key.hpp>
-#include <libp2p/crypto/crypto_provider.hpp>
-#include <libp2p/crypto/crypto_provider/crypto_provider_impl.hpp>
-#include <libp2p/crypto/common.hpp>
-#include <libp2p/crypto/random_generator/boost_generator.hpp>
-#include <libp2p/crypto/ed25519_provider/ed25519_provider_impl.hpp>
-#include <libp2p/crypto/rsa_provider/rsa_provider_impl.hpp>
-#include <libp2p/crypto/ecdsa_provider/ecdsa_provider_impl.hpp>
-#include <libp2p/crypto/secp256k1_provider/secp256k1_provider_impl.hpp>
-#include <libp2p/crypto/hmac_provider/hmac_provider_impl.hpp>
-#include <soralog/logging_system.hpp>
-#include <soralog/impl/configurator_from_yaml.hpp>
-#include <libp2p/protocol/factory/protocol_factory.hpp>
 #include <boost/format.hpp>
-#include <boost/di.hpp>
+#include <libp2p/injector/host_injector.hpp>
+#include <libp2p/injector/kademlia_injector.hpp>
+#include <libp2p/injector/network_injector.hpp>
+#include <libp2p/protocol/factory/protocol_factory.hpp>
+#include <libp2p/security/noise.hpp>
+#include <libp2p/log/logger.hpp>
+#include <libp2p/multi/content_identifier_codec.hpp>
+#include <libp2p/log/configurator.hpp>
+#include <boost/di/extension/scopes/shared.hpp>
 
 #include "../src/bitswap.hpp"
 #include "../src/logger.hpp"
@@ -58,6 +40,7 @@ public:
     }
 
     void initializeNode() {
+        namespace di = boost::di;
         std::cout << "[" << node_name_ << "] Initializing bitswap node on port " << port_ << std::endl;
         
         // Create crypto providers with different instances per node to ensure unique keys
@@ -67,51 +50,16 @@ public:
         auto ecdsa_provider = std::make_shared<libp2p::crypto::ecdsa::EcdsaProviderImpl>();
         auto secp256k1_provider = std::make_shared<libp2p::crypto::secp256k1::Secp256k1ProviderImpl>();
         auto hmac_provider = std::make_shared<libp2p::crypto::hmac::HmacProviderImpl>();
-        auto crypto_provider = std::make_shared<libp2p::crypto::CryptoProviderImpl>(
-            csprng, ed25519_provider, rsa_provider, ecdsa_provider, 
-            secp256k1_provider, hmac_provider);
-        
+        std::shared_ptr<libp2p::crypto::CryptoProvider> crypto_provider = std::make_shared<libp2p::crypto::CryptoProviderImpl>(
+            csprng, ed25519_provider, rsa_provider, ecdsa_provider, secp256k1_provider, hmac_provider);
+        auto validator = std::make_shared<libp2p::crypto::validator::KeyValidatorImpl>(crypto_provider);
+
         std::cout << "[" << node_name_ << "] Crypto providers created" << std::endl;
         
         // Use pre-generated different keys for each node to ensure uniqueness
-        libp2p::crypto::KeyPair keys;
+        std::optional<libp2p::crypto::KeyPair> keys;
         
-        if (port_ == 40300) { // Server node
-            // Server private key (32 bytes for Ed25519)
-            std::vector<uint8_t> server_private_key = {
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 
-                0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
-                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-                0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00
-            };
-            libp2p::crypto::PrivateKey private_key;
-            private_key.type = libp2p::crypto::Key::Type::Ed25519;
-            private_key.data = server_private_key;
-            
-            auto public_key_result = crypto_provider->derivePublicKey(private_key);
-            if (!public_key_result) {
-                throw std::runtime_error("Failed to derive server public key: " + public_key_result.error().message());
-            }
-            keys = libp2p::crypto::KeyPair{public_key_result.value(), private_key};
-        } else { // Client node  
-            // Client private key (different from server)
-            std::vector<uint8_t> client_private_key = {
-                0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
-                0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
-                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-                0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89
-            };
-            libp2p::crypto::PrivateKey private_key;
-            private_key.type = libp2p::crypto::Key::Type::Ed25519;
-            private_key.data = client_private_key;
-            
-            auto public_key_result = crypto_provider->derivePublicKey(private_key);
-            if (!public_key_result) {
-                throw std::runtime_error("Failed to derive client public key: " + public_key_result.error().message());
-            }
-            keys = libp2p::crypto::KeyPair{public_key_result.value(), private_key};
-        }
-        
+        keys = crypto_provider->generateKeys(libp2p::crypto::Key::Type::Ed25519).value();
         std::cout << "[" << node_name_ << "] Fixed keys created for port " << port_ << std::endl;
         
         // Create event bus
@@ -121,11 +69,13 @@ public:
         
         // Create host with explicit key binding
         namespace di = boost::di;
-        auto injector = libp2p::injector::makeHostInjector(
+        auto injector = libp2p::injector::makeHostInjector<di::extension::shared_config>(
             libp2p::injector::useSecurityAdaptors<libp2p::security::Noise>(),
-            di::bind<libp2p::crypto::KeyPair>().to(std::move(keys))[di::override],
+            di::bind<libp2p::crypto::KeyPair>().to(std::move(*keys))[di::override],
             di::bind<libp2p::crypto::CryptoProvider>().to(crypto_provider)[di::override],
-            di::bind<libp2p::crypto::random::CSPRNG>().to(std::move(csprng))[di::override]
+            di::bind<libp2p::crypto::random::CSPRNG>().to(std::move(csprng))[di::override],
+            di::bind<libp2p::crypto::marshaller::KeyMarshaller>().TEMPLATE_TO<libp2p::crypto::marshaller::KeyMarshallerImpl>()[di::override],
+            di::bind<libp2p::crypto::validator::KeyValidator>().TEMPLATE_TO(std::move(validator))[di::override]
         );
         
         std::cout << "[" << node_name_ << "] Injector created, creating host..." << std::endl;
@@ -280,12 +230,12 @@ groups:
         
         // Create server node on port 40300
         server_node_ = std::make_unique<BitswapNode>("SERVER", 40300);
-        
+           // Give nodes time to initialize
+        std::this_thread::sleep_for(std::chrono::seconds(2));     
         // Create client node on port 40301  
         client_node_ = std::make_unique<BitswapNode>("CLIENT", 40301);
         
-        // Give nodes time to initialize
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+
         
         // Check if nodes have different peer IDs
         auto server_peer_info = server_node_->getPeerInfo();
