@@ -382,14 +382,11 @@ groups:
             }
         );
         
-        // Wait for publish to complete
+        // Wait for publish to complete - IO contexts are already running in their own threads
         auto start_time = std::chrono::steady_clock::now();
         const auto timeout = std::chrono::seconds(30);
         
         while (!publish_completed) {
-            server_node_->getIOContext()->poll_one();
-            client_node_->getIOContext()->poll_one();
-            
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed > timeout) {
                 std::cerr << "[TIMEOUT] Publish operation timed out" << std::endl;
@@ -450,14 +447,11 @@ groups:
             }
         );
         
-        // Wait for request to complete
+        // Wait for request to complete - IO contexts are already running in their own threads
         auto start_time = std::chrono::steady_clock::now();
         const auto timeout = std::chrono::seconds(60);
         
         while (!request_completed) {
-            server_node_->getIOContext()->poll_one();
-            client_node_->getIOContext()->poll_one();
-            
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed > timeout) {
                 std::cerr << "[TIMEOUT] Content request timed out" << std::endl;

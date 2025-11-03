@@ -137,7 +137,7 @@ namespace sgns::ipfs_bitswap {
         {
             auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
             rw->read<bitswap_pb::Message>(
-                [ctx = shared_from_this(), stream](libp2p::outcome::result<bitswap_pb::Message> rmsg) {
+                [ctx = shared_from_this(), stream, rw](libp2p::outcome::result<bitswap_pb::Message> rmsg) {
                     if (!rmsg)
                     {
                         ctx->logger_->error("bitswap message cannot be decoded");
@@ -145,12 +145,18 @@ namespace sgns::ipfs_bitswap {
                     }
 
                     BitswapMessage msg(rmsg.value());
-
-                    ctx->logger_->debug("wantlist size: {}", msg.GetWantlistSize());
-
-                    // Process wantlist first - this means we're acting as a server
-                    bool isServerResponse = msg.GetWantlistSize() > 0;
                     
+                    ctx->logger_->debug("Received message: wantlist size: {}, blocks size: {}", 
+                                       msg.GetWantlistSize(), msg.GetBlocksSize());
+
+                    // If we receive a message with wantlist items, we act as a server
+                    // If we receive a message with blocks, we act as a client
+                    bool hasWantlist = msg.GetWantlistSize() > 0;
+                    bool hasBlocks = msg.GetBlocksSize() > 0;
+                    
+                    ctx->logger_->debug("Message flags: hasWantlist={}, hasBlocks={}", hasWantlist, hasBlocks);
+                    
+                    // Process wantlist requests (server side)
                     for (int i = 0; i < msg.GetWantlistSize(); ++i)
                     {
                         auto blockId = msg.GetWantlistEntry(i).block();
@@ -164,6 +170,8 @@ namespace sgns::ipfs_bitswap {
                     }
 
                     ctx->logger_->debug("Processing {} blocks from bitswap message", msg.GetBlocksSize());
+                    
+                    // Process blocks (client side)
                     for (int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx)
                     {
                         const auto& block = msg.GetBlock(blockIdx);
@@ -203,12 +211,16 @@ namespace sgns::ipfs_bitswap {
                         }
                     }
                     
-                    // Only continue reading if we're a client (not processing wantlist requests)
-                    // and we haven't received blocks yet (still waiting for response)
-                    if (!isServerResponse && msg.GetBlocksSize() == 0) {
+                    // Set up continuous reading based on what we received
+                    if (hasWantlist && !hasBlocks) {
+                        // We're a server that received a wantlist - don't set up additional reads
+                        ctx->logger_->debug("Server side: processed wantlist, not setting up additional reads");
+                    } else if (!hasWantlist && !hasBlocks) {
+                        // We're a client that sent a wantlist and haven't received blocks yet
                         ctx->logger_->debug("Client side: setting up read for block response");
                         rw->read<bitswap_pb::Message>(
-                            [ctx, stream](libp2p::outcome::result<bitswap_pb::Message> nextMsg) {
+                            [ctx, stream, rw](libp2p::outcome::result<bitswap_pb::Message> nextMsg) {
+                                ctx->logger_->debug("Client attempting to read response message...");
                                 if (nextMsg) {
                                     BitswapMessage nextBitswapMsg(nextMsg.value());
                                     ctx->logger_->debug("Client received response with {} blocks", nextBitswapMsg.GetBlocksSize());
@@ -233,11 +245,11 @@ namespace sgns::ipfs_bitswap {
                                         }
                                     }
                                 } else {
-                                    ctx->logger_->debug("No response received or stream closed");
+                                    ctx->logger_->debug("Client read failed: {}", nextMsg.error().message());
                                 }
                             });
-                    } else if (isServerResponse) {
-                        ctx->logger_->debug("Server side: processed wantlist, not setting up additional reads");
+                    } else {
+                        ctx->logger_->debug("Message processed: wantlist={}, blocks={}", hasWantlist, hasBlocks);
                     }
                 });
         }
@@ -342,6 +354,43 @@ namespace sgns::ipfs_bitswap {
             requestContext->AddCallback(std::move(onBlockCallback));
             requestContexts_.emplace(cid, std::move(requestContext));
         }
+
+        // Set up read operation to listen for server response
+        auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
+        logger_->debug("Client setting up read operation for server response to CID: {}", cidToString(cid));
+        rw->read<bitswap_pb::Message>(
+            [ctx = shared_from_this(), stream, cid](libp2p::outcome::result<bitswap_pb::Message> responseMsg) {
+                ctx->logger_->debug("Client attempting to read response message for CID: {}", cidToString(cid));
+                if (responseMsg) {
+                    BitswapMessage responseBitswapMsg(responseMsg.value());
+                    ctx->logger_->debug("Client received response with {} blocks for CID: {}", 
+                                       responseBitswapMsg.GetBlocksSize(), cidToString(cid));
+                    
+                    // Process blocks in the response
+                    for (int blockIdx = 0; blockIdx < responseBitswapMsg.GetBlocksSize(); ++blockIdx) {
+                        const auto& block = responseBitswapMsg.GetBlock(blockIdx);
+                        ctx->logger_->debug("Client response block received ({} bytes)", block.size());
+
+                        auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(block.data(), block.size());
+                        auto blockCid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)cidV0.data(), cidV0.size()));
+                        if (blockCid) {
+                            auto scid = libp2p::multi::ContentIdentifierCodec::toString(blockCid.value()).value();
+                            ctx->logger_->debug("Client response block CID: {}", scid);
+
+                            std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
+                            auto itContext = ctx->requestContexts_.find(blockCid.value());
+                            if (itContext != ctx->requestContexts_.end()) {
+                                ctx->logger_->debug("Client found matching request context for response CID: {}", scid);
+                                itContext->second->HandleResponse(block);
+                            } else {
+                                ctx->logger_->warn("Client no request context found for received block CID: {}", scid);
+                            }
+                        }
+                    }
+                } else {
+                    ctx->logger_->debug("Client read failed for CID {}: {}", cidToString(cid), responseMsg.error().message());
+                }
+            });
 
         // Keep stream open for reuse - don't close it
         logger_->debug("stream kept open for reuse");
@@ -1322,6 +1371,8 @@ namespace sgns::ipfs_bitswap {
         BitswapMessage msg(pb_msg);
         
         logger_->debug("Preparing to send block response for CID: {} ({} bytes block data)", cidToString(cid), blockData.size());
+        logger_->debug("Stream state before response: closed={}, closedForRead={}, closedForWrite={}", 
+                      stream->isClosed(), stream->isClosedForRead(), stream->isClosedForWrite());
         
         // Add the block to the message - the blockData should be the raw content without CID prefix
         pb_msg.add_blocks(blockData);
@@ -1331,10 +1382,12 @@ namespace sgns::ipfs_bitswap {
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
         rw->write<bitswap_pb::Message>(
             pb_msg,
-            [ctx = shared_from_this(), cid, blockSize = blockData.size()](auto&& writtenBytes) {
+            [ctx = shared_from_this(), cid, blockSize = blockData.size(), stream](auto&& writtenBytes) {
                 if (writtenBytes) {
                     ctx->logger_->debug("Successfully sent block response for CID: {} ({} bytes written, {} block size)",
                                        cidToString(cid), writtenBytes.value(), blockSize);
+                    ctx->logger_->debug("Stream state after response: closed={}, closedForRead={}, closedForWrite={}", 
+                                       stream->isClosed(), stream->isClosedForRead(), stream->isClosedForWrite());
                 } else {
                     ctx->logger_->error("Failed to send block response for CID: {}, error: {}",
                                        cidToString(cid), writtenBytes.error().message());
