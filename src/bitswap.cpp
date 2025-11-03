@@ -354,7 +354,6 @@ namespace sgns::ipfs_bitswap {
             requestContext->AddCallback(std::move(onBlockCallback));
             requestContexts_.emplace(cid, std::move(requestContext));
         }
-
         // Set up read operation to listen for server response
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
         logger_->debug("Client setting up read operation for server response to CID: {}", cidToString(cid));
@@ -1290,23 +1289,25 @@ namespace sgns::ipfs_bitswap {
 
     CID Bitswap::createIPLDNodeAndStoreUnixFS(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links)
     {
+        // Create IPLD-encoded data for transmission (what real IPFS nodes send)
         // Convert to common::Buffer for the encoder
         common::Buffer content(unixfsData);
         
         // Convert links to the format expected by the encoder
         std::map<std::string, ipfs_lite::ipld::IPLDLinkImpl> ipldLinks;
-        for (const auto& [name, cid] : links) {
+        for (const auto& [name, linkCid] : links) {
             // Convert to sgns::CID type and determine the size - for now use 0, should be improved
-            sgns::CID sgnsCid(cid);
+            sgns::CID sgnsCid(linkCid);
             ipldLinks[name] = ipfs_lite::ipld::IPLDLinkImpl(sgnsCid, name, 0);
         }
         
-        // Encode IPLD node to calculate CID
+        // Encode IPLD node for storage and transmission
         std::vector<uint8_t> encodedNode = ipfs_lite::ipld::IPLDNodeEncoderPB::encode(
             content, ipldLinks, std::set<std::string>{}
         );
         
-        // Calculate CID for the encoded node
+        // Calculate CID from the IPLD-encoded data (same way real IPFS nodes do)
+        // This ensures the server and client calculate the same CID
         auto cidResult = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(
             encodedNode.data(), encodedNode.size()
         );
@@ -1325,9 +1326,9 @@ namespace sgns::ipfs_bitswap {
             throw std::runtime_error("Failed to decode created CID: " + cid.error().message());
         }
         
-        // Store the UnixFS data (not the IPLD-encoded data) for bitswap protocol
-        std::string unixfsDataStr(unixfsData.begin(), unixfsData.end());
-        storeBlock(cid.value(), unixfsDataStr);
+        // Store the IPLD-encoded data (what real IPFS nodes store and send)
+        std::string ipldDataStr(encodedNode.begin(), encodedNode.end());
+        storeBlock(cid.value(), ipldDataStr);
         
         return cid.value();
     }
