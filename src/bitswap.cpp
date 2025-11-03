@@ -148,6 +148,9 @@ namespace sgns::ipfs_bitswap {
 
                     ctx->logger_->debug("wantlist size: {}", msg.GetWantlistSize());
 
+                    // Process wantlist first - this means we're acting as a server
+                    bool isServerResponse = msg.GetWantlistSize() > 0;
+                    
                     for (int i = 0; i < msg.GetWantlistSize(); ++i)
                     {
                         auto blockId = msg.GetWantlistEntry(i).block();
@@ -160,6 +163,7 @@ namespace sgns::ipfs_bitswap {
                         }
                     }
 
+                    ctx->logger_->debug("Processing {} blocks from bitswap message", msg.GetBlocksSize());
                     for (int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx)
                     {
                         const auto& block = msg.GetBlock(blockIdx);
@@ -177,12 +181,63 @@ namespace sgns::ipfs_bitswap {
                             ctx->logger_->debug("Block CID: {}", scid);
 
                             std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
+                            ctx->logger_->debug("Currently have {} request contexts", ctx->requestContexts_.size());
+                            
                             auto itContext = ctx->requestContexts_.find(cid.value());
                             if (itContext != ctx->requestContexts_.end())
                             {
+                                ctx->logger_->debug("Found matching request context for CID: {}, calling HandleResponse", scid);
                                 itContext->second->HandleResponse(block);
                             }
+                            else
+                            {
+                                ctx->logger_->warn("No request context found for received block CID: {}", scid);
+                                // Debug: List all current request contexts
+                                for (const auto& [reqCid, reqCtx] : ctx->requestContexts_) {
+                                    auto reqCidStr = libp2p::multi::ContentIdentifierCodec::toString(reqCid);
+                                    if (reqCidStr) {
+                                        ctx->logger_->debug("  Available request context CID: {}", reqCidStr.value());
+                                    }
+                                }
+                            }
                         }
+                    }
+                    
+                    // Only continue reading if we're a client (not processing wantlist requests)
+                    // and we haven't received blocks yet (still waiting for response)
+                    if (!isServerResponse && msg.GetBlocksSize() == 0) {
+                        ctx->logger_->debug("Client side: setting up read for block response");
+                        rw->read<bitswap_pb::Message>(
+                            [ctx, stream](libp2p::outcome::result<bitswap_pb::Message> nextMsg) {
+                                if (nextMsg) {
+                                    BitswapMessage nextBitswapMsg(nextMsg.value());
+                                    ctx->logger_->debug("Client received response with {} blocks", nextBitswapMsg.GetBlocksSize());
+                                    
+                                    // Process blocks in the response
+                                    for (int blockIdx = 0; blockIdx < nextBitswapMsg.GetBlocksSize(); ++blockIdx) {
+                                        const auto& block = nextBitswapMsg.GetBlock(blockIdx);
+                                        ctx->logger_->debug("Response block received ({} bytes)", block.size());
+
+                                        auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(block.data(), block.size());
+                                        auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)cidV0.data(), cidV0.size()));
+                                        if (cid) {
+                                            auto scid = libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value();
+                                            ctx->logger_->debug("Response block CID: {}", scid);
+
+                                            std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
+                                            auto itContext = ctx->requestContexts_.find(cid.value());
+                                            if (itContext != ctx->requestContexts_.end()) {
+                                                ctx->logger_->debug("Found matching request context for response CID: {}", scid);
+                                                itContext->second->HandleResponse(block);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    ctx->logger_->debug("No response received or stream closed");
+                                }
+                            });
+                    } else if (isServerResponse) {
+                        ctx->logger_->debug("Server side: processed wantlist, not setting up additional reads");
                     }
                 });
         }
@@ -1099,8 +1154,8 @@ namespace sgns::ipfs_bitswap {
         // Create UnixFS data
         std::vector<uint8_t> unixfsData = createUnixFSData(data, type, data.size());
         
-        // Create IPLD node
-        CID cid = createIPLDNode(unixfsData);
+        // Create IPLD node to calculate the CID, but store the UnixFS data for bitswap
+        CID cid = createIPLDNodeAndStoreUnixFS(unixfsData);
         
         if (!cid.content_address.toBuffer().empty()) {
             logger_->debug("Encoded and stored {} bytes as CID: {}", data.size(), cidToString(cid));
@@ -1184,6 +1239,50 @@ namespace sgns::ipfs_bitswap {
         return cid.value();
     }
 
+    CID Bitswap::createIPLDNodeAndStoreUnixFS(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links)
+    {
+        // Convert to common::Buffer for the encoder
+        common::Buffer content(unixfsData);
+        
+        // Convert links to the format expected by the encoder
+        std::map<std::string, ipfs_lite::ipld::IPLDLinkImpl> ipldLinks;
+        for (const auto& [name, cid] : links) {
+            // Convert to sgns::CID type and determine the size - for now use 0, should be improved
+            sgns::CID sgnsCid(cid);
+            ipldLinks[name] = ipfs_lite::ipld::IPLDLinkImpl(sgnsCid, name, 0);
+        }
+        
+        // Encode IPLD node to calculate CID
+        std::vector<uint8_t> encodedNode = ipfs_lite::ipld::IPLDNodeEncoderPB::encode(
+            content, ipldLinks, std::set<std::string>{}
+        );
+        
+        // Calculate CID for the encoded node
+        auto cidResult = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(
+            encodedNode.data(), encodedNode.size()
+        );
+        
+        if (cidResult.empty()) {
+            logger_->error("Failed to create CID for IPLD node");
+            throw std::runtime_error("Failed to create CID for IPLD node");
+        }
+        
+        auto cid = libp2p::multi::ContentIdentifierCodec::decode(
+            gsl::span(reinterpret_cast<const uint8_t*>(cidResult.data()), cidResult.size())
+        );
+        
+        if (!cid) {
+            logger_->error("Failed to decode created CID: {}", cid.error().message());
+            throw std::runtime_error("Failed to decode created CID: " + cid.error().message());
+        }
+        
+        // Store the UnixFS data (not the IPLD-encoded data) for bitswap protocol
+        std::string unixfsDataStr(unixfsData.begin(), unixfsData.end());
+        storeBlock(cid.value(), unixfsDataStr);
+        
+        return cid.value();
+    }
+
     void Bitswap::storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath)
     {
         std::lock_guard<std::mutex> guard(mutexBlockStore_);
@@ -1222,8 +1321,12 @@ namespace sgns::ipfs_bitswap {
         bitswap_pb::Message pb_msg;
         BitswapMessage msg(pb_msg);
         
-        // Add the block to the message (using protobuf directly since AddBlock method doesn't exist)
-        pb_msg.add_blocks(blockData.data(), blockData.size());
+        logger_->debug("Preparing to send block response for CID: {} ({} bytes block data)", cidToString(cid), blockData.size());
+        
+        // Add the block to the message - the blockData should be the raw content without CID prefix
+        pb_msg.add_blocks(blockData);
+        
+        logger_->debug("Added block to protobuf message, total blocks in message: {}", pb_msg.blocks_size());
         
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
         rw->write<bitswap_pb::Message>(

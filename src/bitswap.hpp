@@ -342,6 +342,7 @@ namespace sgns::ipfs_bitswap
         std::vector<uint8_t> createUnixFSData(const std::vector<uint8_t>& content, unixfs_pb::Data::DataType type, 
                                               uint64_t filesize = 0, const std::vector<CID>& links = {});
         CID createIPLDNode(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links = {});
+        CID createIPLDNodeAndStoreUnixFS(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links = {});
         void storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath = "");
         void handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream);
         void sendBlockResponse(const CID& cid, const std::string& blockData, std::shared_ptr<libp2p::connection::Stream> stream);

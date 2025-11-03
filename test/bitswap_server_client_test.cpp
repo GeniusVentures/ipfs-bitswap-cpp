@@ -3,6 +3,7 @@
 #include <thread>
 #include <chrono>
 #include <boost/format.hpp>
+#include <boost/asio.hpp>
 #include <libp2p/injector/host_injector.hpp>
 #include <libp2p/injector/kademlia_injector.hpp>
 #include <libp2p/injector/network_injector.hpp>
@@ -11,12 +12,69 @@
 #include <libp2p/log/logger.hpp>
 #include <libp2p/multi/content_identifier_codec.hpp>
 #include <libp2p/log/configurator.hpp>
+#include <libp2p/peer/peer_repository.hpp>
+#include <libp2p/peer/address_repository.hpp>
+#include <libp2p/network/route_helper.hpp>
 #include <boost/di/extension/scopes/shared.hpp>
+#include <gsl/span>
 
 #include "../src/bitswap.hpp"
 #include "../src/logger.hpp"
 
 using namespace sgns::ipfs_bitswap;
+
+// Helper function to get local IP address that's not loopback
+std::string getLocalIPAddress() {
+    try {
+        boost::asio::io_context io_context;
+        boost::asio::ip::tcp::resolver resolver(io_context);
+        boost::asio::ip::tcp::resolver::results_type endpoints = 
+            resolver.resolve(boost::asio::ip::host_name(), "");
+        
+        std::string priority_ip;
+        std::string fallback_ip;
+        
+        for (const auto& endpoint : endpoints) {
+            auto addr = endpoint.endpoint().address();
+            if (addr.is_v4() && !addr.is_loopback()) {
+                std::string ip = addr.to_string();
+                
+                // Skip unspecified and link-local addresses
+                if (ip == "0.0.0.0" || ip.find("169.254.") == 0) {
+                    continue;
+                }
+                
+                // Prioritize standard LAN addresses
+                if (ip.find("192.168.") == 0 || ip.find("10.") == 0 || 
+                    (ip.find("172.") == 0 && ip.substr(4, 1) >= "16" && ip.substr(4, 1) <= "31")) {
+                    // Standard private network ranges (RFC 1918)
+                    // 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12
+                    priority_ip = ip;
+                    std::cout << "[DEBUG] Found priority LAN address: " << ip << std::endl;
+                    break; // Use the first priority address we find
+                } else if (fallback_ip.empty()) {
+                    // Keep the first non-priority address as fallback (e.g., public IP, virtual interfaces)
+                    fallback_ip = ip;
+                    std::cout << "[DEBUG] Found fallback address: " << ip << std::endl;
+                }
+            }
+        }
+        
+        if (!priority_ip.empty()) {
+            return priority_ip;
+        } else if (!fallback_ip.empty()) {
+            std::cout << "[INFO] Using fallback address: " << fallback_ip << std::endl;
+            return fallback_ip;
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "[WARNING] Failed to get local IP address: " << e.what() << std::endl;
+    }
+    
+    // Fallback to localhost if we can't find a better address
+    std::cout << "[WARNING] No suitable IP address found, falling back to localhost" << std::endl;
+    return "127.0.0.1";
+}
 
 class BitswapNode {
 private:
@@ -98,8 +156,8 @@ public:
         auto protocols = libp2p::protocol::factory::ProtocolFactory::createProtocols(host_, protocol_config, injector);
         protocols.identify->start();
         
-        // Bind Listen Address
-        auto bindaddress = (boost::format("/ip4/%s/tcp/%d/p2p/%s") % "127.0.0.1" % port_ % host_->getId().toBase58()).str();
+        // Bind Listen Address  
+        auto bindaddress = (boost::format("/ip4/%s/tcp/%d/p2p/%s") % "0.0.0.0" % port_ % host_->getId().toBase58()).str();
         
         std::vector<libp2p::multi::Multiaddress> multiaddresses;
         auto ma_res = libp2p::multi::Multiaddress::create(bindaddress);
@@ -157,8 +215,18 @@ public:
     }
 
     libp2p::peer::PeerInfo getPeerInfo() const {
-        auto bindaddress = (boost::format("/ip4/%s/tcp/%d/p2p/%s") % "127.0.0.1" % port_ % host_->getId().toBase58()).str();
-        auto ma_res = libp2p::multi::Multiaddress::create(bindaddress);
+        // Get the actual local IP address (not localhost) for other nodes to connect to
+        std::string local_ip = getLocalIPAddress();
+        auto peer_addr_str = (boost::format("/ip4/%s/tcp/%d/p2p/%s") % local_ip % port_ % host_->getId().toBase58()).str();
+        
+        auto ma_res = libp2p::multi::Multiaddress::create(peer_addr_str);
+        if (!ma_res) {
+            std::cerr << "[ERROR] Failed to create peer multiaddress: " << ma_res.error().message() << std::endl;
+            // Fallback to localhost
+            peer_addr_str = (boost::format("/ip4/%s/tcp/%d/p2p/%s") % "127.0.0.1" % port_ % host_->getId().toBase58()).str();
+            ma_res = libp2p::multi::Multiaddress::create(peer_addr_str);
+        }
+        
         auto ma = std::move(ma_res.value());
         auto peer_id_str = ma.getPeerId();
         auto peer_id_res = libp2p::peer::PeerId::fromBase58(*peer_id_str);
@@ -168,6 +236,10 @@ public:
 
     std::shared_ptr<Bitswap> getBitswap() const {
         return bitswap_;
+    }
+
+    std::shared_ptr<libp2p::Host> getHost() const {
+        return host_;
     }
 
     std::shared_ptr<boost::asio::io_context> getIOContext() const {
@@ -250,6 +322,32 @@ groups:
         std::cout << "[SETUP] Server peer ID: " << server_peer_info.id.toBase58() << std::endl;
         std::cout << "[SETUP] Client peer ID: " << client_peer_info.id.toBase58() << std::endl;
         std::cout << "[SETUP] Both nodes created successfully with different peer IDs" << std::endl;
+        
+        // Add server peer info to client's peer repository so it knows how to connect
+        std::cout << "[SETUP] Adding server peer info to client..." << std::endl;
+        auto client_host = client_node_->getHost();
+        auto& peer_repo = client_host->getPeerRepository();
+        auto& addr_repo = peer_repo.getAddressRepository();
+        
+        // Add server's addresses to client's peer repository
+        auto add_result = addr_repo.upsertAddresses(
+            server_peer_info.id,
+            gsl::span(server_peer_info.addresses.data(), server_peer_info.addresses.size()),
+            libp2p::peer::ttl::kDay
+        );
+        
+        if (add_result) {
+            std::cout << "[SETUP] Successfully added server peer info to client" << std::endl;
+        } else {
+            std::cerr << "[WARNING] Failed to add server peer info to client: " << add_result.error().message() << std::endl;
+        }
+        
+        // Show server addresses for debugging
+        std::cout << "[DEBUG] Server addresses:" << std::endl;
+        for (const auto& addr : server_peer_info.addresses) {
+            std::cout << "[DEBUG]   " << addr.getStringAddress() << std::endl;
+        }
+        
         return true;
     }
 
