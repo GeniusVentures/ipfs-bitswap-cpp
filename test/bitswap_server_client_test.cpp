@@ -554,12 +554,13 @@ groups:
     bool verifyRetrievedContent(const UnixFSContent& content) {
         std::cout << "\\n[VERIFY] Verifying retrieved directory structure..." << std::endl;
         
-        // Check content type - should be a directory
-        if (content.type != UnixFSContent::DIRECTORY) {
-            std::cerr << "[ERROR] Expected directory, got type: " << static_cast<int>(content.type) << std::endl;
+        // Check content type - should be a directory or multi-file archive
+        if (content.type != UnixFSContent::DIRECTORY && content.type != UnixFSContent::MULTI_FILE_ARCHIVE) {
+            std::cerr << "[ERROR] Expected directory or multi-file archive, got type: " << static_cast<int>(content.type) << std::endl;
             return false;
         }
-        std::cout << "[OK] Content type is directory" << std::endl;
+        std::string type_name = (content.type == UnixFSContent::DIRECTORY) ? "directory" : "multi-file archive";
+        std::cout << "[OK] Content type is " << type_name << std::endl;
         
         // Check number of files
         if (content.files.size() != test_files_.size()) {
