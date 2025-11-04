@@ -213,8 +213,50 @@ namespace sgns::ipfs_bitswap {
                     
                     // Set up continuous reading based on what we received
                     if (hasWantlist && !hasBlocks) {
-                        // We're a server that received a wantlist - don't set up additional reads
-                        ctx->logger_->debug("Server side: processed wantlist, not setting up additional reads");
+                        // We're a server that received a wantlist - set up continuous reading
+                        ctx->logger_->debug("Server side: processed wantlist, setting up continuous read for subsequent requests");
+                        
+                        // Lambda function for recursive server reading
+                        std::function<void()> setupServerRead = [ctx, stream, rw, setupServerRead = std::shared_ptr<std::function<void()>>(new std::function<void()>)]() mutable {
+                            *setupServerRead = [ctx, stream, rw, setupServerRead]() {
+                                rw->read<bitswap_pb::Message>(
+                                    [ctx, stream, rw, setupServerRead](libp2p::outcome::result<bitswap_pb::Message> nextMsg) {
+                                        if (nextMsg) {
+                                            ctx->logger_->debug("Server received continuous request, processing...");
+                                            BitswapMessage nextBitswapMsg(nextMsg.value());
+                                            
+                                            // Process the received message
+                                            ctx->logger_->debug("Received message: wantlist size: {}, blocks size: {}", 
+                                                               nextBitswapMsg.GetWantlistSize(), nextBitswapMsg.GetBlocksSize());
+                                            
+                                            bool nextHasWantlist = nextBitswapMsg.GetWantlistSize() > 0;
+                                            bool nextHasBlocks = nextBitswapMsg.GetBlocksSize() > 0;
+                                            ctx->logger_->debug("Message flags: hasWantlist={}, hasBlocks={}", nextHasWantlist, nextHasBlocks);
+                                            
+                                            // Process wantlist requests (server side)
+                                            for (int i = 0; i < nextBitswapMsg.GetWantlistSize(); ++i) {
+                                                auto blockId = nextBitswapMsg.GetWantlistEntry(i).block();
+                                                auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
+                                                if (cid) {
+                                                    ctx->logger_->trace("wantlist item[{}]: {}", i, libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value());
+                                                    ctx->handleWantlistRequest(cid.value(), stream);
+                                                }
+                                            }
+                                            
+                                            // Continue reading for more requests
+                                            if (nextHasWantlist && !nextHasBlocks) {
+                                                ctx->logger_->debug("Server side: processed wantlist, continuing continuous read loop");
+                                                (*setupServerRead)();
+                                            }
+                                        } else {
+                                            ctx->logger_->debug("Server continuous read ended: {}", nextMsg.error().message());
+                                        }
+                                    });
+                            };
+                            (*setupServerRead)();
+                        };
+                        
+                        setupServerRead();
                     } else if (!hasWantlist && !hasBlocks) {
                         // We're a client that sent a wantlist and haven't received blocks yet
                         ctx->logger_->debug("Client side: setting up read for block response");

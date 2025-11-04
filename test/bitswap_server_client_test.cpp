@@ -2,6 +2,10 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <cstring>
 #include <boost/format.hpp>
 #include <boost/asio.hpp>
 #include <libp2p/injector/host_injector.hpp>
@@ -86,6 +90,7 @@ private:
     std::string node_name_;
     int port_;
     bool is_running_;
+    std::unique_ptr<boost::asio::io_context::work> work_guard_;  // Keep IO context alive
     
 public:
     BitswapNode(const std::string& name, int port) 
@@ -144,6 +149,9 @@ public:
         
         // Get the IO context from the same injector
         io_context_ = injector.create<std::shared_ptr<boost::asio::io_context>>();
+        
+        // Create work guard to keep IO context alive during complex operations
+        work_guard_ = std::make_unique<boost::asio::io_context::work>(*io_context_);
 
         // Config Protocols
         libp2p::protocol::factory::ProtocolFactory::ProtocolConfig protocol_config;
@@ -199,6 +207,9 @@ public:
         if (host_) {
             host_->stop();
         }
+        
+        // Release work guard to allow IO context to exit
+        work_guard_.reset();
         
         // Stop the IO context
         if (io_context_ && !io_context_->stopped()) {
@@ -256,8 +267,23 @@ private:
     std::unique_ptr<BitswapNode> server_node_;
     std::unique_ptr<BitswapNode> client_node_;
     
-    // Test data
-    const std::string test_content_ = "Hello, this is a test message from the bitswap server!\\nThis demonstrates bidirectional communication.\\nLine 3 of test data.";
+    // Test data - complex directory structure
+    struct TestFile {
+        std::string path;
+        std::string content;
+    };
+    
+    std::vector<TestFile> test_files_ = {
+        {"README.md", "# Project Documentation\n\nThis is the main README file for our test project.\nIt contains important information about the project structure and usage."},
+        {"config.json", "{\n  \"name\": \"bitswap-test\",\n  \"version\": \"1.0.0\",\n  \"debug\": true,\n  \"ports\": [8080, 8081, 8082]\n}"},
+        {"src/main.cpp", "#include <iostream>\n#include <string>\n\nint main() {\n    std::cout << \"Hello from bitswap test!\" << std::endl;\n    return 0;\n}"},
+        {"src/utils.hpp", "#pragma once\n\n#include <string>\n#include <vector>\n\nnamespace utils {\n    std::string join(const std::vector<std::string>& parts, const std::string& delimiter);\n    std::vector<std::string> split(const std::string& input, char delimiter);\n}"},
+        {"docs/api.md", "# API Documentation\n\n## Endpoints\n\n### GET /status\nReturns the current status of the service.\n\n### POST /data\nAccepts data for processing."},
+        {"docs/examples/example1.txt", "This is example file 1.\nIt demonstrates basic functionality.\nLine 3 of example content."},
+        {"docs/examples/example2.txt", "Example file 2 content here.\nThis shows how multiple files work together.\nFinal line of example 2."},
+        {"tests/unit_test.cpp", "#include <gtest/gtest.h>\n\nTEST(BasicTest, SimpleAssertion) {\n    EXPECT_EQ(2 + 2, 4);\n    EXPECT_TRUE(true);\n}\n\nTEST(StringTest, Concatenation) {\n    std::string result = \"Hello\" + std::string(\" World\");\n    EXPECT_EQ(result, \"Hello World\");\n}"}
+    };
+    
     std::optional<CID> published_cid_;
     
 public:
@@ -352,61 +378,116 @@ groups:
     }
 
     bool publishTestContent() {
-        std::cout << "\\n[PUBLISH] Publishing test content to server..." << std::endl;
-        std::cout << "[CONTENT] Data: '" << test_content_ << "'" << std::endl;
-        std::cout << "[CONTENT] Size: " << test_content_.size() << " bytes" << std::endl;
+        std::cout << "\\n[PUBLISH] Publishing complex directory structure to server..." << std::endl;
+        std::cout << "[CONTENT] Creating directory structure with " << test_files_.size() << " files:" << std::endl;
         
-        bool publish_completed = false;
-        bool publish_success = false;
-        std::string error_message;
+        // Display the structure we're creating
+        for (const auto& file : test_files_) {
+            std::cout << "[FILE] " << file.path << " (" << file.content.size() << " bytes)" << std::endl;
+        }
         
-        // Publish the test content as raw data
-        server_node_->getBitswap()->PublishData(
-            std::vector<uint8_t>(test_content_.begin(), test_content_.end()),
-            [&](libp2p::outcome::result<CID> result) {
-                if (!result) {
-                    error_message = result.error().message();
-                    std::cerr << "[ERROR] Failed to publish content: " << error_message << std::endl;
-                    publish_success = false;
-                } else {
-                    published_cid_ = result.value();
-                    auto cid_str_result = libp2p::multi::ContentIdentifierCodec::toString(published_cid_.value());
-                    if (cid_str_result) {
-                        std::cout << "[SUCCESS] Content published with CID: " << cid_str_result.value() << std::endl;
-                    } else {
-                        std::cout << "[SUCCESS] Content published (CID encoding failed)" << std::endl;
-                    }
-                    publish_success = true;
-                }
-                publish_completed = true;
+        // Create temporary directory structure for publishing
+        std::string temp_dir = "temp_test_content";
+        std::filesystem::path temp_path(temp_dir);
+        
+        try {
+            // Clean up any existing temp directory
+            if (std::filesystem::exists(temp_path)) {
+                std::filesystem::remove_all(temp_path);
             }
-        );
-        
-        // Wait for publish to complete - IO contexts are already running in their own threads
-        auto start_time = std::chrono::steady_clock::now();
-        const auto timeout = std::chrono::seconds(30);
-        
-        while (!publish_completed) {
-            auto elapsed = std::chrono::steady_clock::now() - start_time;
-            if (elapsed > timeout) {
-                std::cerr << "[TIMEOUT] Publish operation timed out" << std::endl;
+            
+            // Create the directory structure and files
+            std::filesystem::create_directories(temp_path);
+            
+            for (const auto& file : test_files_) {
+                std::filesystem::path file_path = temp_path / file.path;
+                
+                // Create parent directories if needed
+                std::filesystem::create_directories(file_path.parent_path());
+                
+                // Write file content
+                std::ofstream ofs(file_path, std::ios::binary);
+                if (!ofs) {
+                    std::cerr << "[ERROR] Failed to create file: " << file_path << std::endl;
+                    return false;
+                }
+                ofs.write(file.content.data(), file.content.size());
+                ofs.close();
+                
+                std::cout << "[CREATED] " << file_path << std::endl;
+            }
+            
+            bool publish_completed = false;
+            bool publish_success = false;
+            std::string error_message;
+            
+            // Publish the entire directory structure
+            server_node_->getBitswap()->PublishDirectory(
+                temp_dir,
+                [&](libp2p::outcome::result<CID> result) {
+                    if (!result) {
+                        error_message = result.error().message();
+                        std::cerr << "[ERROR] Failed to publish directory: " << error_message << std::endl;
+                        publish_success = false;
+                    } else {
+                        published_cid_ = result.value();
+                        auto cid_str_result = libp2p::multi::ContentIdentifierCodec::toString(published_cid_.value());
+                        if (cid_str_result) {
+                            std::cout << "[SUCCESS] Directory structure published with CID: " << cid_str_result.value() << std::endl;
+                        } else {
+                            std::cout << "[SUCCESS] Directory structure published (CID encoding failed)" << std::endl;
+                        }
+                        publish_success = true;
+                    }
+                    publish_completed = true;
+                }
+            );
+            
+            // Wait for publish to complete - IO contexts are already running in their own threads
+            auto start_time = std::chrono::steady_clock::now();
+            const auto timeout = std::chrono::seconds(60); // Increased timeout for complex structure
+            
+            while (!publish_completed) {
+                auto elapsed = std::chrono::steady_clock::now() - start_time;
+                if (elapsed > timeout) {
+                    std::cerr << "[TIMEOUT] Publish operation timed out" << std::endl;
+                    return false;
+                }
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            
+            // Clean up temporary directory
+            if (std::filesystem::exists(temp_path)) {
+                std::filesystem::remove_all(temp_path);
+                std::cout << "[CLEANUP] Temporary directory removed" << std::endl;
+            }
+            
+            if (!publish_success) {
+                std::cerr << "[FAILED] Publish failed: " << error_message << std::endl;
                 return false;
             }
             
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        
-        if (!publish_success) {
-            std::cerr << "[FAILED] Publish failed: " << error_message << std::endl;
+            std::cout << "[PUBLISH] Complex directory structure successfully published and available for retrieval" << std::endl;
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] Exception during publish: " << e.what() << std::endl;
+            
+            // Clean up on error
+            if (std::filesystem::exists(temp_path)) {
+                try {
+                    std::filesystem::remove_all(temp_path);
+                } catch (...) {
+                    // Ignore cleanup errors
+                }
+            }
             return false;
         }
-        
-        std::cout << "[PUBLISH] Content successfully published and available for retrieval" << std::endl;
-        return true;
     }
 
     bool testClientRetrieval() {
-        std::cout << "\\n[RETRIEVE] Client requesting content from server..." << std::endl;
+        std::cout << "\\n[RETRIEVE] Client requesting directory structure from server..." << std::endl;
         
         if (!published_cid_) {
             std::cerr << "[ERROR] No published CID available" << std::endl;
@@ -415,9 +496,9 @@ groups:
         
         auto cid_str_result = libp2p::multi::ContentIdentifierCodec::toString(published_cid_.value());
         if (cid_str_result) {
-            std::cout << "[REQUEST] CID: " << cid_str_result.value() << std::endl;
+            std::cout << "[REQUEST] Directory CID: " << cid_str_result.value() << std::endl;
         } else {
-            std::cout << "[REQUEST] CID: (encoding failed)" << std::endl;
+            std::cout << "[REQUEST] Directory CID: (encoding failed)" << std::endl;
         }
         
         // Get server peer info
@@ -429,18 +510,18 @@ groups:
         std::string error_message;
         UnixFSContent retrieved_content;
         
-        // Request content from server
+        // Request directory structure from server
         client_node_->getBitswap()->RequestContent(
             server_peer_info, 
             published_cid_.value(), 
             [&](libp2p::outcome::result<UnixFSContent> result) {
                 if (!result) {
                     error_message = result.error().message();
-                    std::cerr << "[ERROR] Content request failed: " << error_message << std::endl;
+                    std::cerr << "[ERROR] Directory request failed: " << error_message << std::endl;
                     request_success = false;
                 } else {
                     retrieved_content = std::move(result.value());
-                    std::cout << "[SUCCESS] Content retrieved successfully!" << std::endl;
+                    std::cout << "[SUCCESS] Directory structure retrieved successfully!" << std::endl;
                     request_success = true;
                 }
                 request_completed = true;
@@ -454,7 +535,7 @@ groups:
         while (!request_completed) {
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed > timeout) {
-                std::cerr << "[TIMEOUT] Content request timed out" << std::endl;
+                std::cerr << "[TIMEOUT] Directory request timed out" << std::endl;
                 return false;
             }
             
@@ -462,55 +543,84 @@ groups:
         }
         
         if (!request_success) {
-            std::cerr << "[FAILED] Request failed: " << error_message << std::endl;
+            std::cerr << "[FAILED] Directory request failed: " << error_message << std::endl;
             return false;
         }
         
-        // Verify content
+        // Verify directory structure
         return verifyRetrievedContent(retrieved_content);
     }
 
     bool verifyRetrievedContent(const UnixFSContent& content) {
-        std::cout << "\\n[VERIFY] Verifying retrieved content..." << std::endl;
+        std::cout << "\\n[VERIFY] Verifying retrieved directory structure..." << std::endl;
         
-        // Check content type
-        if (content.type != UnixFSContent::SINGLE_FILE) {
-            std::cerr << "[ERROR] Expected single file, got type: " << static_cast<int>(content.type) << std::endl;
+        // Check content type - should be a directory
+        if (content.type != UnixFSContent::DIRECTORY) {
+            std::cerr << "[ERROR] Expected directory, got type: " << static_cast<int>(content.type) << std::endl;
             return false;
         }
-        std::cout << "[OK] Content type is single file" << std::endl;
+        std::cout << "[OK] Content type is directory" << std::endl;
         
         // Check number of files
-        if (content.files.size() != 1) {
-            std::cerr << "[ERROR] Expected 1 file, got: " << content.files.size() << std::endl;
+        if (content.files.size() != test_files_.size()) {
+            std::cerr << "[ERROR] File count mismatch. Expected: " << test_files_.size() 
+                      << ", got: " << content.files.size() << std::endl;
+            std::cerr << "[INFO] Retrieved files:" << std::endl;
+            for (const auto& file : content.files) {
+                std::cerr << "[INFO]   " << file.path << " (" << file.content.size() << " bytes)" << std::endl;
+            }
             return false;
         }
-        std::cout << "[OK] Content contains exactly 1 file" << std::endl;
+        std::cout << "[OK] Directory contains " << content.files.size() << " files" << std::endl;
         
-        const auto& file = content.files[0];
+        // Create a map of retrieved files for easy lookup
+        std::map<std::string, const UnixFSFile*> retrieved_files;
+        for (const auto& file : content.files) {
+            retrieved_files[file.path] = &file;
+        }
         
-        // Check file size
-        if (file.content.size() != test_content_.size()) {
-            std::cerr << "[ERROR] Size mismatch. Expected: " << test_content_.size() 
-                      << ", got: " << file.content.size() << std::endl;
+        // Verify each expected file
+        bool all_verified = true;
+        for (const auto& expected_file : test_files_) {
+            auto it = retrieved_files.find(expected_file.path);
+            if (it == retrieved_files.end()) {
+                std::cerr << "[ERROR] Missing file: " << expected_file.path << std::endl;
+                all_verified = false;
+                continue;
+            }
+            
+            const auto* retrieved_file = it->second;
+            
+            // Check file size
+            if (retrieved_file->content.size() != expected_file.content.size()) {
+                std::cerr << "[ERROR] Size mismatch for " << expected_file.path 
+                          << ". Expected: " << expected_file.content.size() 
+                          << ", got: " << retrieved_file->content.size() << std::endl;
+                all_verified = false;
+                continue;
+            }
+            
+            // Check content
+            if (std::memcmp(retrieved_file->content.data(), expected_file.content.data(), expected_file.content.size()) != 0) {
+                std::cerr << "[ERROR] Content mismatch for " << expected_file.path << std::endl;
+                all_verified = false;
+                continue;
+            }
+            
+            std::cout << "[OK] ✅ " << expected_file.path << " (" << retrieved_file->content.size() << " bytes)" << std::endl;
+        }
+        
+        if (all_verified) {
+            std::cout << "\\n[SUCCESS] ✅ Directory structure verification passed!" << std::endl;
+            std::cout << "[SUCCESS] All " << test_files_.size() << " files verified successfully:" << std::endl;
+            for (const auto& expected_file : test_files_) {
+                std::cout << "[SUCCESS]   " << expected_file.path << " (" << expected_file.content.size() << " bytes)" << std::endl;
+            }
+            return true;
+        } else {
+            std::cerr << "\\n[FAILED] ❌ Directory structure verification failed!" << std::endl;
             return false;
         }
-        std::cout << "[OK] File size matches: " << file.content.size() << " bytes" << std::endl;
-        
-        // Check content
-        std::string retrieved_text(file.content.begin(), file.content.end());
-        if (retrieved_text != test_content_) {
-            std::cerr << "[ERROR] Content mismatch!" << std::endl;
-            std::cerr << "Expected: '" << test_content_ << "'" << std::endl;
-            std::cerr << "Got:      '" << retrieved_text << "'" << std::endl;
-            return false;
-        }
-        std::cout << "[OK] Content matches exactly!" << std::endl;
-        
-        std::cout << "[CONTENT] Retrieved: '" << retrieved_text << "'" << std::endl;
-        
-        std::cout << "\\n[SUCCESS] Content verification passed!" << std::endl;
-        return true;
     }
 
     void run() {

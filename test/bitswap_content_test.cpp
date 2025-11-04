@@ -32,6 +32,7 @@ private:
     std::shared_ptr<Bitswap> bitswap_;
     std::shared_ptr<libp2p::event::Bus> event_bus_;
     std::thread m_thread;
+    std::unique_ptr<boost::asio::io_context::work> work_guard_;  // Keep IO context alive
     
 public:
     BitswapContentTest() {
@@ -74,6 +75,9 @@ groups:
         
         // Get the IO context from the same injector (crucial - must be same as host uses!)
         io_context_ = injector.create<std::shared_ptr<boost::asio::io_context>>();
+        
+        // Create work guard to keep IO context alive during complex operations
+        work_guard_ = std::make_unique<boost::asio::io_context::work>(*io_context_);
 
         //Config Protocols
         libp2p::protocol::factory::ProtocolFactory::ProtocolConfig protocol_config;
@@ -124,6 +128,9 @@ groups:
         if (host_) {
             host_->stop();
         }
+        
+        // Release work guard to allow IO context to exit
+        work_guard_.reset();
         
         // Stop the IO context
         if (io_context_ && !io_context_->stopped()) {
@@ -209,10 +216,6 @@ groups:
         const auto timeout = std::chrono::seconds(130);
         
         while (!request_completed) {
-            // Give the IO context a chance to process events
-            // Even though we have a separate thread, this helps ensure all events are processed
-            io_context_->poll_one();
-            
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed > timeout) {
                 std::cerr << "[TIMEOUT] Request timed out after 30 seconds" << std::endl;
