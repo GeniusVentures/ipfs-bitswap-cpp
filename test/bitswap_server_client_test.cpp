@@ -27,6 +27,9 @@
 
 using namespace sgns::ipfs_bitswap;
 
+// Forward declaration 
+std::string cidToString(const libp2p::multi::ContentIdentifier& cid);
+
 // Helper function to get local IP address that's not loopback
 std::string getLocalIPAddress() {
     try {
@@ -646,6 +649,12 @@ groups:
                 success = false;
             }
             
+            // Test individual file CID retrieval
+            if (success && !testIndividualFileRetrieval()) {
+                std::cerr << "[FAILED] Individual file retrieval failed" << std::endl;
+                success = false;
+            }
+            
             if (success) {
                 std::cout << "\\n[COMPLETE] ✅ All tests passed! Bitswap server-client communication working!" << std::endl;
             } else {
@@ -654,6 +663,120 @@ groups:
             
         } catch (const std::exception& e) {
             std::cerr << "[EXCEPTION] Test failed with exception: " << e.what() << std::endl;
+        }
+    }
+
+    bool testIndividualFileRetrieval() {
+        std::cout << "\\n[TEST] Testing individual file CID retrieval..." << std::endl;
+        
+        try {
+            std::string temp_file = "temp_individual_test.txt";
+            std::string file_content = "This is a test file for individual CID retrieval.";
+            
+            // Create test file
+            {
+                std::ofstream test_file(temp_file);
+                test_file << file_content;
+            }
+            
+            std::cout << "[SETUP] Created test file: " << temp_file << " (" << file_content.size() << " bytes)" << std::endl;
+            
+            // Publish the file to get its CID
+            std::optional<CID> individual_file_cid;
+            bool publish_complete = false;
+            bool publish_success = false;
+            
+            server_node_->getBitswap()->PublishFile(temp_file, [&](libp2p::outcome::result<CID> result) {
+                if (result.has_value()) {
+                    individual_file_cid = result.value();
+                    publish_success = true;
+                    std::cout << "[PUBLISH] Individual file published successfully" << std::endl;
+                } else {
+                    std::cerr << "[ERROR] Failed to publish individual file" << std::endl;
+                    publish_success = false;
+                }
+                publish_complete = true;
+            });
+            
+            // Wait for publish to complete
+            while (!publish_complete) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            
+            // Clean up temp file
+            std::filesystem::remove(temp_file);
+            
+            if (!publish_success) {
+                return false;
+            }
+            
+            // Now request this specific file CID from the client
+            std::cout << "[REQUEST] Client requesting individual file CID..." << std::endl;
+            
+            UnixFSContent retrieved_content;
+            bool request_complete = false;
+            bool request_success = false;
+            
+            // Use the correct parameter order: RequestContent(PeerInfo, CID, callback)
+            client_node_->getBitswap()->RequestContent(server_node_->getPeerInfo(),
+                individual_file_cid.value(), [&](libp2p::outcome::result<UnixFSContent> result) {
+                if (result.has_value()) {
+                    retrieved_content = result.value();
+                    request_success = true;
+                    std::cout << "[SUCCESS] Individual file retrieved successfully!" << std::endl;
+                } else {
+                    std::cerr << "[ERROR] Failed to retrieve individual file" << std::endl;
+                    request_success = false;
+                }
+                request_complete = true;
+            });
+            
+            // Wait for request to complete (with timeout)
+            auto start_time = std::chrono::steady_clock::now();
+            auto timeout = std::chrono::seconds(10);
+            
+            while (!request_complete) {
+                auto elapsed = std::chrono::steady_clock::now() - start_time;
+                if (elapsed > timeout) {
+                    std::cerr << "[ERROR] Individual file request timed out" << std::endl;
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            
+            if (!request_success) {
+                return false;
+            }
+            
+            // Verify the retrieved content
+            if (retrieved_content.type != UnixFSContent::SINGLE_FILE) {
+                std::cerr << "[ERROR] Expected single file, got type: " << static_cast<int>(retrieved_content.type) << std::endl;
+                return false;
+            }
+            
+            if (retrieved_content.files.size() != 1) {
+                std::cerr << "[ERROR] Expected 1 file, got: " << retrieved_content.files.size() << std::endl;
+                return false;
+            }
+            
+            const auto& file = retrieved_content.files[0];
+            std::string retrieved_content_str(file.content.begin(), file.content.end());
+            
+            if (retrieved_content_str != file_content) {
+                std::cerr << "[ERROR] Content mismatch!" << std::endl;
+                std::cerr << "[ERROR] Expected: " << file_content << std::endl;
+                std::cerr << "[ERROR] Got: " << retrieved_content_str << std::endl;
+                return false;
+            }
+            
+            std::cout << "[VERIFY] ✅ Individual file content verified (" << file.content.size() << " bytes)" << std::endl;
+            std::cout << "[SUCCESS] ✅ Individual file CID retrieval test passed!" << std::endl;
+            
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "[EXCEPTION] Individual file test failed: " << e.what() << std::endl;
+            return false;
         }
     }
 };

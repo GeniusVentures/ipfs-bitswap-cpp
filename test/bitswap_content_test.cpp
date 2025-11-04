@@ -378,7 +378,8 @@ groups:
         // Test parameters
         const std::string ipfs_node = "/ip4/192.168.46.124/tcp/4001/p2p/12D3KooWHsD2QEUS5FzHEyq2bTuwMSEuEvV86wVAc7VaDDKK1NwJ";
         const std::string test_cid = "QmdHvvEXRUgmyn1q3nkQwf9yE412Vzy5gSuGAukHRLicXA";
-        
+        //const std::string test_cid = "QmYLPzpsxFwDMWiayyvBH8UYcKxcS1wQf6keGMnYX9uGcN";
+
         // Connect to IPFS node
         if (!connectToIPFSNode(ipfs_node)) {
             std::cerr << "[ERROR] Failed to connect to IPFS node" << std::endl;
