@@ -8,6 +8,9 @@
 #include <fstream>
 #include <filesystem>
 #include <thread>
+#include <algorithm>
+#include <random>
+#include <functional>
 
 #include <libp2p/basic/protobuf_message_read_writer.hpp>
 #include <libp2p/multi/content_identifier_codec.hpp>
@@ -195,6 +198,12 @@ namespace sgns::ipfs_bitswap {
                             if (itContext != ctx->requestContexts_.end())
                             {
                                 ctx->logger_->debug("Found matching request context for CID: {}, calling HandleResponse", scid);
+                                
+                                // Mark provider success
+                                if (auto remotePeer = stream->remotePeerId()) {
+                                    ctx->markProviderSuccess(cid.value(), remotePeer.value());
+                                }
+                                
                                 itContext->second->HandleResponse(block);
                             }
                             else
@@ -282,6 +291,12 @@ namespace sgns::ipfs_bitswap {
                                             auto itContext = ctx->requestContexts_.find(cid.value());
                                             if (itContext != ctx->requestContexts_.end()) {
                                                 ctx->logger_->debug("Found matching request context for response CID: {}", scid);
+                                                
+                                                // Mark provider success
+                                                if (auto remotePeer = stream->remotePeerId()) {
+                                                    ctx->markProviderSuccess(cid.value(), remotePeer.value());
+                                                }
+                                                
                                                 itContext->second->HandleResponse(block);
                                             }
                                         }
@@ -377,6 +392,12 @@ namespace sgns::ipfs_bitswap {
         {
             logger_->error("cannot write bitswap message to stream to peer: {}", writtenBytes.error().message());
             stream->reset();
+            
+            // Mark provider failure
+            if (auto remotePeer = stream->remotePeerId()) {
+                markProviderFailure(cid, remotePeer.value());
+            }
+            
             onBlockCallback(BitswapError::MESSAGE_SENDING_FAILURE);
             return;
         }
@@ -422,6 +443,12 @@ namespace sgns::ipfs_bitswap {
                             auto itContext = ctx->requestContexts_.find(blockCid.value());
                             if (itContext != ctx->requestContexts_.end()) {
                                 ctx->logger_->debug("Client found matching request context for response CID: {}", scid);
+                                
+                                // Mark provider success
+                                if (auto remotePeer = stream->remotePeerId()) {
+                                    ctx->markProviderSuccess(blockCid.value(), remotePeer.value());
+                                }
+                                
                                 itContext->second->HandleResponse(block);
                             } else {
                                 ctx->logger_->warn("Client no request context found for received block CID: {}", scid);
@@ -470,6 +497,50 @@ namespace sgns::ipfs_bitswap {
 
         // Start with the root CID
         RequestBlock(pi, cid, [this, ctx](libp2p::outcome::result<std::string> blockResult) {
+            if (!blockResult) {
+                if (!ctx->timedOut) {
+                    ctx->callback(blockResult.error());
+                    std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                    contentRequests_.erase(ctx->rootCID);
+                }
+                return;
+            }
+            processUnixFSBlock(ctx, ctx->rootCID, blockResult.value(), "");
+        });
+    }
+
+    void Bitswap::RequestContent(
+        const CID& cid,
+        ContentCallback onContentCallback)
+    {
+        logger_->debug("RequestContent (auto-select peer) called for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+
+        auto ctx = std::make_shared<ContentRequestContext>(*context_, cid);
+        ctx->callback = std::move(onContentCallback);
+        ctx->useProviders = true;  // Enable provider-based requests
+        ctx->pendingCIDs.insert(cid);
+
+        {
+            std::lock_guard<std::mutex> guard(mutexContentRequests_);
+            contentRequests_[cid] = ctx;
+        }
+
+        // Set up timeout
+        ctx->timeout.expires_from_now(ctx->contentTimeout_);
+        ctx->timeout.async_wait([this, cid](const boost::system::error_code& ec) {
+            if (!ec) {  // Timer wasn't cancelled
+                std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                auto it = contentRequests_.find(cid);
+                if (it != contentRequests_.end() && !it->second->timedOut) {
+                    it->second->timedOut = true;
+                    it->second->callback(BitswapError::CONTENT_REQUEST_TIMEOUT);
+                    contentRequests_.erase(it);
+                }
+            }
+        });
+
+        // Start with the root CID using provider-based requests
+        requestBlockWithProviders(cid, [this, ctx](libp2p::outcome::result<std::string> blockResult) {
             if (!blockResult) {
                 if (!ctx->timedOut) {
                     ctx->callback(blockResult.error());
@@ -544,6 +615,9 @@ namespace sgns::ipfs_bitswap {
                     {
                         ctx->logger_->error("Failed to create stream to peer {} (attempt {}): {}", 
                                            pi.id.toBase58(), retryCount + 1, rstream.error().message());
+                        
+                        // Mark provider failure
+                        ctx->markProviderFailure(cid, pi.id);
                         
                         // Clear any stale cached streams for this peer
                         {
@@ -1053,36 +1127,70 @@ namespace sgns::ipfs_bitswap {
         
         logger_->debug("Processing queued request for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(nextCid).value());
         
-        RequestBlock(ctx->peerInfo.value(), nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> result) {
-            ctx->processingQueue = false;
-            
-            if (!result) {
-                if (!ctx->timedOut) {
-                    ctx->callback(result.error());
-                    std::lock_guard<std::mutex> guard(mutexContentRequests_);
-                    contentRequests_.erase(ctx->rootCID);
+        // Use provider-based request if enabled, otherwise use specific peer
+        if (ctx->useProviders) {
+            requestBlockWithProviders(nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> result) {
+                ctx->processingQueue = false;
+                
+                if (!result) {
+                    if (!ctx->timedOut) {
+                        ctx->callback(result.error());
+                        std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                        contentRequests_.erase(ctx->rootCID);
+                    }
+                    return;
                 }
-                return;
-            }
-            
-            // Look up the path for this CID
-            std::string path = "";
-            auto pathIt = ctx->cidToPath.find(nextCid);
-            if (pathIt != ctx->cidToPath.end()) {
-                path = pathIt->second;
-            }
-            
-            processUnixFSBlock(ctx, nextCid, result.value(), path);
-            
-            // Process next item in queue after a short delay
-            auto timer = std::make_shared<boost::asio::deadline_timer>(*context_);
-            timer->expires_from_now(boost::posix_time::milliseconds(200));
-            timer->async_wait([this, ctx, timer](const boost::system::error_code& ec) {
-                if (!ec && !ctx->timedOut) {
-                    processRequestQueue(ctx);
+                
+                // Look up the path for this CID
+                std::string path = "";
+                auto pathIt = ctx->cidToPath.find(nextCid);
+                if (pathIt != ctx->cidToPath.end()) {
+                    path = pathIt->second;
                 }
+                
+                processUnixFSBlock(ctx, nextCid, result.value(), path);
+                
+                // Process next item in queue after a short delay
+                auto timer = std::make_shared<boost::asio::deadline_timer>(*context_);
+                timer->expires_from_now(boost::posix_time::milliseconds(200));
+                timer->async_wait([this, ctx, timer](const boost::system::error_code& ec) {
+                    if (!ec && !ctx->timedOut) {
+                        processRequestQueue(ctx);
+                    }
+                });
             });
-        });
+        } else {
+            RequestBlock(ctx->peerInfo.value(), nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> result) {
+                ctx->processingQueue = false;
+                
+                if (!result) {
+                    if (!ctx->timedOut) {
+                        ctx->callback(result.error());
+                        std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                        contentRequests_.erase(ctx->rootCID);
+                    }
+                    return;
+                }
+                
+                // Look up the path for this CID
+                std::string path = "";
+                auto pathIt = ctx->cidToPath.find(nextCid);
+                if (pathIt != ctx->cidToPath.end()) {
+                    path = pathIt->second;
+                }
+                
+                processUnixFSBlock(ctx, nextCid, result.value(), path);
+                
+                // Process next item in queue after a short delay
+                auto timer = std::make_shared<boost::asio::deadline_timer>(*context_);
+                timer->expires_from_now(boost::posix_time::milliseconds(200));
+                timer->async_wait([this, ctx, timer](const boost::system::error_code& ec) {
+                    if (!ec && !ctx->timedOut) {
+                        processRequestQueue(ctx);
+                    }
+                });
+            });
+        }
     }
 
     // Server-side implementation methods
@@ -1617,6 +1725,308 @@ namespace sgns::ipfs_bitswap {
         }
         
         return result;
+    }
+
+    // Provider management implementation
+
+    void Bitswap::AddProvider(const CID& cid, const libp2p::peer::PeerInfo& peerInfo)
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        auto& providerList = providers_[cid];
+        
+        // Check if peer already exists in the list
+        auto existingPeer = std::find_if(providerList.begin(), providerList.end(),
+            [&peerInfo](const PeerProvider& provider) {
+                return provider.peerInfo.id == peerInfo.id;
+            });
+        
+        if (existingPeer != providerList.end()) {
+            // Update existing peer info and mark as recently seen
+            existingPeer->peerInfo = peerInfo;
+            existingPeer->lastSeen = std::chrono::steady_clock::now();
+            existingPeer->isReachable = true;
+            logger_->debug("Updated existing provider {} for CID: {}", 
+                          peerInfo.id.toBase58(), cidToString(cid));
+        } else {
+            // Add new provider
+            providerList.emplace_back(peerInfo);
+            logger_->debug("Added new provider {} for CID: {} (total: {})", 
+                          peerInfo.id.toBase58(), cidToString(cid), providerList.size());
+        }
+    }
+
+    void Bitswap::RemoveProvider(const CID& cid, const libp2p::peer::PeerId& peerId)
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        auto providerIt = providers_.find(cid);
+        if (providerIt != providers_.end()) {
+            auto& providerList = providerIt->second;
+            
+            auto peerIt = std::remove_if(providerList.begin(), providerList.end(),
+                [&peerId](const PeerProvider& provider) {
+                    return provider.peerInfo.id == peerId;
+                });
+            
+            if (peerIt != providerList.end()) {
+                providerList.erase(peerIt, providerList.end());
+                logger_->debug("Removed provider {} for CID: {}", 
+                              peerId.toBase58(), cidToString(cid));
+                
+                // Clean up empty provider lists
+                if (providerList.empty()) {
+                    providers_.erase(providerIt);
+                }
+            }
+        }
+    }
+
+    std::vector<PeerProvider> Bitswap::GetProviders(const CID& cid) const
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        auto providerIt = providers_.find(cid);
+        if (providerIt != providers_.end()) {
+            return providerIt->second;
+        }
+        
+        return {};
+    }
+
+    void Bitswap::ClearProviders(const CID& cid)
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        providers_.erase(cid);
+        logger_->debug("Cleared all providers for CID: {}", cidToString(cid));
+    }
+
+    void Bitswap::SetMaxPeerAttempts(size_t maxPeers)
+    {
+        maxPeerAttempts_ = maxPeers;
+        logger_->debug("Set max peer attempts to: {}", maxPeers);
+    }
+
+    void Bitswap::SetPeerFailureThreshold(int threshold)
+    {
+        peerFailureThreshold_ = threshold;
+        logger_->debug("Set peer failure threshold to: {}", threshold);
+    }
+
+    void Bitswap::AddProviders(const CID& cid, const std::vector<libp2p::peer::PeerInfo>& peerInfos)
+    {
+        for (const auto& peerInfo : peerInfos) {
+            AddProvider(cid, peerInfo);
+        }
+        logger_->debug("Added {} providers for CID: {}", peerInfos.size(), cidToString(cid));
+    }
+
+    size_t Bitswap::GetTotalProviderCount() const
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        size_t totalCount = 0;
+        for (const auto& [cid, providers] : providers_) {
+            totalCount += providers.size();
+        }
+        
+        return totalCount;
+    }
+
+    std::map<std::string, std::vector<std::string>> Bitswap::GetProviderDebugInfo() const
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        std::map<std::string, std::vector<std::string>> debugInfo;
+        
+        for (const auto& [cid, providers] : providers_) {
+            std::string cidStr = cidToString(cid);
+            std::vector<std::string> providerInfos;
+            
+            for (const auto& provider : providers) {
+                std::string info = provider.peerInfo.id.toBase58() + 
+                    " (failures: " + std::to_string(provider.failureCount) + 
+                    ", reachable: " + (provider.isReachable ? "yes" : "no") + ")";
+                providerInfos.push_back(info);
+            }
+            
+            debugInfo[cidStr] = std::move(providerInfos);
+        }
+        
+        return debugInfo;
+    }
+
+    libp2p::peer::PeerInfo Bitswap::selectBestProvider(const CID& cid)
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        auto providerIt = providers_.find(cid);
+        if (providerIt == providers_.end() || providerIt->second.empty()) {
+            throw std::runtime_error("No providers available for CID");
+        }
+        
+        auto& providerList = providerIt->second;
+        
+        // Filter out unreachable providers
+        std::vector<std::reference_wrapper<PeerProvider>> reachableProviders;
+        for (auto& provider : providerList) {
+            if (provider.isReachable && provider.failureCount < peerFailureThreshold_) {
+                reachableProviders.push_back(std::ref(provider));
+            }
+        }
+        
+        if (reachableProviders.empty()) {
+            // Reset all providers and try again (maybe network conditions changed)
+            logger_->warn("All providers marked as unreachable for CID: {}, resetting", cidToString(cid));
+            for (auto& provider : providerList) {
+                provider.isReachable = true;
+                provider.failureCount = 0;
+                reachableProviders.push_back(std::ref(provider));
+            }
+        }
+        
+        if (reachableProviders.empty()) {
+            throw std::runtime_error("No reachable providers available for CID");
+        }
+        
+        // Sort by failure count (ascending) and last seen (descending)
+        std::sort(reachableProviders.begin(), reachableProviders.end(),
+            [](const std::reference_wrapper<PeerProvider>& a, const std::reference_wrapper<PeerProvider>& b) {
+                if (a.get().failureCount != b.get().failureCount) {
+                    return a.get().failureCount < b.get().failureCount;
+                }
+                return a.get().lastSeen > b.get().lastSeen;
+            });
+        
+        // Select a random provider from the best ones (top 25% or at least 1)
+        size_t candidateCount = std::max(static_cast<size_t>(1), reachableProviders.size() / 4);
+        size_t selectedIndex = std::rand() % candidateCount;
+        
+        auto& selectedProvider = reachableProviders[selectedIndex].get();
+        selectedProvider.lastSeen = std::chrono::steady_clock::now();
+        
+        logger_->debug("Selected provider {} for CID: {} (failures: {}, total providers: {})", 
+                      selectedProvider.peerInfo.id.toBase58(), cidToString(cid), 
+                      selectedProvider.failureCount, providerList.size());
+        
+        return selectedProvider.peerInfo;
+    }
+
+    void Bitswap::markProviderFailure(const CID& cid, const libp2p::peer::PeerId& peerId)
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        auto providerIt = providers_.find(cid);
+        if (providerIt != providers_.end()) {
+            auto& providerList = providerIt->second;
+            
+            auto peerIt = std::find_if(providerList.begin(), providerList.end(),
+                [&peerId](PeerProvider& provider) {
+                    return provider.peerInfo.id == peerId;
+                });
+            
+            if (peerIt != providerList.end()) {
+                peerIt->failureCount++;
+                if (peerIt->failureCount >= peerFailureThreshold_) {
+                    peerIt->isReachable = false;
+                    logger_->warn("Marked provider {} as unreachable for CID: {} (failures: {})", 
+                                 peerId.toBase58(), cidToString(cid), peerIt->failureCount);
+                } else {
+                    logger_->debug("Incremented failure count for provider {} for CID: {} (failures: {})", 
+                                  peerId.toBase58(), cidToString(cid), peerIt->failureCount);
+                }
+            }
+        }
+    }
+
+    void Bitswap::markProviderSuccess(const CID& cid, const libp2p::peer::PeerId& peerId)
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        auto providerIt = providers_.find(cid);
+        if (providerIt != providers_.end()) {
+            auto& providerList = providerIt->second;
+            
+            auto peerIt = std::find_if(providerList.begin(), providerList.end(),
+                [&peerId](PeerProvider& provider) {
+                    return provider.peerInfo.id == peerId;
+                });
+            
+            if (peerIt != providerList.end()) {
+                peerIt->failureCount = std::max(0, peerIt->failureCount - 1); // Gradually reduce failure count
+                peerIt->isReachable = true;
+                peerIt->lastSeen = std::chrono::steady_clock::now();
+                logger_->debug("Marked provider {} as successful for CID: {} (failures: {})", 
+                              peerId.toBase58(), cidToString(cid), peerIt->failureCount);
+            }
+        }
+    }
+
+    void Bitswap::cleanupStaleProviders()
+    {
+        std::lock_guard<std::mutex> guard(mutexProviders_);
+        
+        auto now = std::chrono::steady_clock::now();
+        auto staleThreshold = std::chrono::hours(1); // Remove providers not seen for 1 hour
+        
+        for (auto providerIt = providers_.begin(); providerIt != providers_.end();) {
+            auto& providerList = providerIt->second;
+            
+            auto newEnd = std::remove_if(providerList.begin(), providerList.end(),
+                [&now, &staleThreshold](const PeerProvider& provider) {
+                    return (now - provider.lastSeen) > staleThreshold;
+                });
+            
+            size_t removedCount = std::distance(newEnd, providerList.end());
+            if (removedCount > 0) {
+                logger_->debug("Removed {} stale providers for CID: {}", 
+                              removedCount, cidToString(providerIt->first));
+            }
+            
+            providerList.erase(newEnd, providerList.end());
+            
+            // Remove empty provider lists
+            if (providerList.empty()) {
+                providerIt = providers_.erase(providerIt);
+            } else {
+                ++providerIt;
+            }
+        }
+    }
+
+    void Bitswap::requestBlockWithProviders(const CID& cid, BlockCallback onBlockCallback, int attemptCount)
+    {
+        if (attemptCount >= static_cast<int>(maxPeerAttempts_)) {
+            logger_->error("Exhausted all {} provider attempts for CID: {}", maxPeerAttempts_, cidToString(cid));
+            onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+            return;
+        }
+
+        // Try to find a provider for this CID
+        try {
+            auto selectedPeer = selectBestProvider(cid);
+            logger_->debug("Attempting to request CID: {} from provider {} (attempt {})", 
+                          cidToString(cid), selectedPeer.id.toBase58(), attemptCount + 1);
+
+            // Make the request with failover handling
+            RequestBlock(selectedPeer, cid, [this, cid, attemptCount, onBlockCallback = std::move(onBlockCallback)](libp2p::outcome::result<std::string> result) mutable {
+                if (!result) {
+                    logger_->warn("Request failed for CID: {} (attempt {}), trying next provider", 
+                                 cidToString(cid), attemptCount + 1);
+                    // Try the next provider
+                    requestBlockWithProviders(cid, std::move(onBlockCallback), attemptCount + 1);
+                } else {
+                    // Success!
+                    logger_->debug("Successfully received block for CID: {} on attempt {}", 
+                                  cidToString(cid), attemptCount + 1);
+                    onBlockCallback(std::move(result));
+                }
+            });
+        } catch (const std::exception& e) {
+            logger_->error("No providers available for CID: {} (attempt {})", cidToString(cid), attemptCount + 1);
+            onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+            return;
+        }
     }
 
 }  // namespace sgns::ipfs_bitswap

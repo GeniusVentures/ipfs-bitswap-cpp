@@ -24,6 +24,17 @@ namespace sgns::ipfs_bitswap
     typedef libp2p::multi::ContentIdentifier CID;
     typedef std::function<void(libp2p::outcome::result<std::string>)> BlockCallback;
 
+    // Peer provider tracking
+    struct PeerProvider {
+        libp2p::peer::PeerInfo peerInfo;
+        std::chrono::steady_clock::time_point lastSeen;
+        int failureCount = 0;
+        bool isReachable = true;
+        
+        PeerProvider(const libp2p::peer::PeerInfo& peer) 
+            : peerInfo(peer), lastSeen(std::chrono::steady_clock::now()) {}
+    };
+
     // UnixFS Content structures
     struct UnixFSFile {
         std::string path;           // e.g., "", "subdir/file.txt" 
@@ -127,8 +138,9 @@ namespace sgns::ipfs_bitswap
         };
 
         CID rootCID;
-        std::optional<libp2p::peer::PeerInfo> peerInfo;  // Store peer info for additional requests
+        std::optional<libp2p::peer::PeerInfo> peerInfo;  // Store peer info for additional requests (optional for provider-based requests)
         ContentCallback callback;
+        bool useProviders = false;  // Whether to use provider system for sub-requests
         std::vector<UnixFSFile> collectedFiles;
         std::set<CID> pendingCIDs;
         
@@ -218,6 +230,74 @@ namespace sgns::ipfs_bitswap
             const libp2p::peer::PeerInfo& pi,
             const CID& cid,
             ContentCallback onContentCallback);
+
+        /**
+        * Requests complete UnixFS content using known providers for the CID
+        * Automatically selects from available peers and handles failover
+        * @param cid - root content identifier
+        * @param onContentCallback - callback with structured content when complete
+        */
+        void RequestContent(
+            const CID& cid,
+            ContentCallback onContentCallback);
+
+        /**
+        * Adds a peer as a provider for a specific CID
+        * @param cid - content identifier
+        * @param peerInfo - peer that provides this content
+        */
+        void AddProvider(const CID& cid, const libp2p::peer::PeerInfo& peerInfo);
+
+        /**
+        * Removes a peer as a provider for a specific CID
+        * @param cid - content identifier  
+        * @param peerId - peer to remove
+        */
+        void RemoveProvider(const CID& cid, const libp2p::peer::PeerId& peerId);
+
+        /**
+        * Gets all known providers for a CID
+        * @param cid - content identifier
+        * @return vector of peer providers
+        */
+        std::vector<PeerProvider> GetProviders(const CID& cid) const;
+
+        /**
+        * Clears all providers for a CID
+        * @param cid - content identifier
+        */
+        void ClearProviders(const CID& cid);
+
+        /**
+        * Sets the maximum number of peers to try per request
+        * @param maxPeers - maximum peers to attempt (default: 3)
+        */
+        void SetMaxPeerAttempts(size_t maxPeers);
+
+        /**
+        * Sets the failure threshold before marking a peer as unreachable
+        * @param threshold - number of failures (default: 3)
+        */
+        void SetPeerFailureThreshold(int threshold);
+
+        /**
+        * Adds multiple providers for a CID (useful when getting results from DHT)
+        * @param cid - content identifier
+        * @param peerInfos - list of peers that provide this content
+        */
+        void AddProviders(const CID& cid, const std::vector<libp2p::peer::PeerInfo>& peerInfos);
+
+        /**
+        * Gets the total number of known providers across all CIDs
+        * @return total provider count
+        */
+        size_t GetTotalProviderCount() const;
+
+        /**
+        * Gets debug information about all providers
+        * @return map of CID strings to provider info strings
+        */
+        std::map<std::string, std::vector<std::string>> GetProviderDebugInfo() const;
 
         /**
         * Publishes a single file to the bitswap network
@@ -331,6 +411,12 @@ namespace sgns::ipfs_bitswap
         std::map<CID, StoredBlock> blockStore_;  // CID -> block data
         std::map<CID, PublishedContent> publishedContent_; // Root CID -> published content info
 
+        // Peer provider tracking
+        mutable std::mutex mutexProviders_;
+        std::map<CID, std::vector<PeerProvider>> providers_; // CID -> list of providers
+        size_t maxPeerAttempts_ = 3;
+        int peerFailureThreshold_ = 3;
+
         Logger logger_ = createLogger("Bitswap");
 
     private:
@@ -346,6 +432,15 @@ namespace sgns::ipfs_bitswap
         void storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath = "");
         void handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream);
         void sendBlockResponse(const CID& cid, const std::string& blockData, std::shared_ptr<libp2p::connection::Stream> stream);
+
+        // Provider management helpers
+        libp2p::peer::PeerInfo selectBestProvider(const CID& cid);
+        void markProviderFailure(const CID& cid, const libp2p::peer::PeerId& peerId);
+        void markProviderSuccess(const CID& cid, const libp2p::peer::PeerId& peerId);
+        void cleanupStaleProviders();
+        
+        // Internal request methods with provider failover
+        void requestBlockWithProviders(const CID& cid, BlockCallback onBlockCallback, int attemptCount = 0);
     };
 }  // ipfs_bitswap
 
