@@ -441,6 +441,7 @@ namespace sgns::ipfs_bitswap
         
         // Internal request methods with provider failover
         void requestBlockWithProviders(const CID& cid, BlockCallback onBlockCallback, int attemptCount = 0);
+        void requestBlockWithProvidersFromRoot(const CID& rootCid, const CID& targetCid, BlockCallback onBlockCallback, int attemptCount = 0);
     };
 }  // ipfs_bitswap
 

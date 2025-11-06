@@ -1153,10 +1153,10 @@ namespace sgns::ipfs_bitswap {
                 if (!result) {
                     // If same-peer request failed and we're using providers, try provider system as fallback
                     if (ctx->useProviders) {
-                        logger_->debug("Same-peer request failed for CID: {}, trying provider system as fallback", 
+                        logger_->debug("Same-peer request failed for CID: {}, trying provider system as fallback using root CID providers", 
                                       libp2p::multi::ContentIdentifierCodec::toString(nextCid).value());
                         
-                        requestBlockWithProviders(nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> fallbackResult) {
+                        requestBlockWithProvidersFromRoot(ctx->rootCID, nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> fallbackResult) {
                             if (!fallbackResult) {
                                 if (!ctx->timedOut) {
                                     ctx->callback(fallbackResult.error());
@@ -2089,6 +2089,43 @@ namespace sgns::ipfs_bitswap {
             });
         } catch (const std::exception& e) {
             logger_->error("No providers available for CID: {} (attempt {})", cidToString(cid), attemptCount + 1);
+            onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+            return;
+        }
+    }
+
+    void Bitswap::requestBlockWithProvidersFromRoot(const CID& rootCid, const CID& targetCid, BlockCallback onBlockCallback, int attemptCount)
+    {
+        if (attemptCount >= static_cast<int>(maxPeerAttempts_)) {
+            logger_->error("Exhausted all {} provider attempts for target CID: {} using root CID: {}", 
+                          maxPeerAttempts_, cidToString(targetCid), cidToString(rootCid));
+            onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
+            return;
+        }
+
+        // Try to find a provider for the root CID (since that's what has providers registered)
+        try {
+            auto selectedPeer = selectBestProvider(rootCid);
+            logger_->debug("Attempting to request target CID: {} from root CID provider {} (attempt {})", 
+                          cidToString(targetCid), selectedPeer.id.toBase58(), attemptCount + 1);
+
+            // Make the request for the target CID using the root CID's provider
+            RequestBlock(selectedPeer, targetCid, [this, rootCid, targetCid, attemptCount, onBlockCallback = std::move(onBlockCallback)](libp2p::outcome::result<std::string> result) mutable {
+                if (!result) {
+                    logger_->warn("Request failed for target CID: {} using root CID provider (attempt {}), trying next provider", 
+                                 cidToString(targetCid), attemptCount + 1);
+                    // Try the next provider from the root CID
+                    requestBlockWithProvidersFromRoot(rootCid, targetCid, std::move(onBlockCallback), attemptCount + 1);
+                } else {
+                    // Success!
+                    logger_->debug("Successfully received block for target CID: {} using root CID provider on attempt {}", 
+                                  cidToString(targetCid), attemptCount + 1);
+                    onBlockCallback(std::move(result));
+                }
+            });
+        } catch (const std::exception& e) {
+            logger_->error("No providers available for root CID: {} when requesting target CID: {} (attempt {})", 
+                          cidToString(rootCid), cidToString(targetCid), attemptCount + 1);
             onBlockCallback(BitswapError::OUTBOUND_STREAM_FAILURE);
             return;
         }
