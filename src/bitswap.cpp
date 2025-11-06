@@ -540,17 +540,31 @@ namespace sgns::ipfs_bitswap {
         });
 
         // Start with the root CID using provider-based requests
-        requestBlockWithProviders(cid, [this, ctx](libp2p::outcome::result<std::string> blockResult) {
-            if (!blockResult) {
-                if (!ctx->timedOut) {
-                    ctx->callback(blockResult.error());
-                    std::lock_guard<std::mutex> guard(mutexContentRequests_);
-                    contentRequests_.erase(ctx->rootCID);
+        try {
+            auto selectedPeer = selectBestProvider(cid);
+            ctx->peerInfo = selectedPeer;  // Store the selected peer for subsequent requests
+            logger_->debug("Selected peer {} for content request CID: {}", 
+                          selectedPeer.id.toBase58(), libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+            
+            RequestBlock(selectedPeer, cid, [this, ctx](libp2p::outcome::result<std::string> blockResult) {
+                if (!blockResult) {
+                    if (!ctx->timedOut) {
+                        ctx->callback(blockResult.error());
+                        std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                        contentRequests_.erase(ctx->rootCID);
+                    }
+                    return;
                 }
-                return;
+                processUnixFSBlock(ctx, ctx->rootCID, blockResult.value(), "");
+            });
+        } catch (const std::exception& e) {
+            logger_->error("No providers available for root CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+            if (!ctx->timedOut) {
+                ctx->callback(BitswapError::OUTBOUND_STREAM_FAILURE);
+                std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                contentRequests_.erase(ctx->rootCID);
             }
-            processUnixFSBlock(ctx, ctx->rootCID, blockResult.value(), "");
-        });
+        }
     }
 
     void Bitswap::RequestBlock(
@@ -1127,8 +1141,80 @@ namespace sgns::ipfs_bitswap {
         
         logger_->debug("Processing queued request for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(nextCid).value());
         
-        // Use provider-based request if enabled, otherwise use specific peer
-        if (ctx->useProviders) {
+        // Always try to use the same peer first if available, then fall back to providers
+        if (ctx->peerInfo.has_value()) {
+            logger_->debug("Using same peer for queued CID: {} from peer: {}", 
+                          libp2p::multi::ContentIdentifierCodec::toString(nextCid).value(),
+                          ctx->peerInfo->id.toBase58());
+            
+            RequestBlock(ctx->peerInfo.value(), nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> result) {
+                ctx->processingQueue = false;
+                
+                if (!result) {
+                    // If same-peer request failed and we're using providers, try provider system as fallback
+                    if (ctx->useProviders) {
+                        logger_->debug("Same-peer request failed for CID: {}, trying provider system as fallback", 
+                                      libp2p::multi::ContentIdentifierCodec::toString(nextCid).value());
+                        
+                        requestBlockWithProviders(nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> fallbackResult) {
+                            if (!fallbackResult) {
+                                if (!ctx->timedOut) {
+                                    ctx->callback(fallbackResult.error());
+                                    std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                                    contentRequests_.erase(ctx->rootCID);
+                                }
+                                return;
+                            }
+                            
+                            // Look up the path for this CID
+                            std::string path = "";
+                            auto pathIt = ctx->cidToPath.find(nextCid);
+                            if (pathIt != ctx->cidToPath.end()) {
+                                path = pathIt->second;
+                            }
+                            
+                            processUnixFSBlock(ctx, nextCid, fallbackResult.value(), path);
+                            
+                            // Process next item in queue after a short delay
+                            auto timer = std::make_shared<boost::asio::deadline_timer>(*context_);
+                            timer->expires_from_now(boost::posix_time::milliseconds(200));
+                            timer->async_wait([this, ctx, timer](const boost::system::error_code& ec) {
+                                if (!ec && !ctx->timedOut) {
+                                    processRequestQueue(ctx);
+                                }
+                            });
+                        });
+                        return;
+                    }
+                    
+                    if (!ctx->timedOut) {
+                        ctx->callback(result.error());
+                        std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                        contentRequests_.erase(ctx->rootCID);
+                    }
+                    return;
+                }
+                
+                // Look up the path for this CID
+                std::string path = "";
+                auto pathIt = ctx->cidToPath.find(nextCid);
+                if (pathIt != ctx->cidToPath.end()) {
+                    path = pathIt->second;
+                }
+                
+                processUnixFSBlock(ctx, nextCid, result.value(), path);
+                
+                // Process next item in queue after a short delay
+                auto timer = std::make_shared<boost::asio::deadline_timer>(*context_);
+                timer->expires_from_now(boost::posix_time::milliseconds(200));
+                timer->async_wait([this, ctx, timer](const boost::system::error_code& ec) {
+                    if (!ec && !ctx->timedOut) {
+                        processRequestQueue(ctx);
+                    }
+                });
+            });
+        } else if (ctx->useProviders) {
+            // Pure provider-based request (no fallback peer available)
             requestBlockWithProviders(nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> result) {
                 ctx->processingQueue = false;
                 
@@ -1160,36 +1246,15 @@ namespace sgns::ipfs_bitswap {
                 });
             });
         } else {
-            RequestBlock(ctx->peerInfo.value(), nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> result) {
-                ctx->processingQueue = false;
-                
-                if (!result) {
-                    if (!ctx->timedOut) {
-                        ctx->callback(result.error());
-                        std::lock_guard<std::mutex> guard(mutexContentRequests_);
-                        contentRequests_.erase(ctx->rootCID);
-                    }
-                    return;
-                }
-                
-                // Look up the path for this CID
-                std::string path = "";
-                auto pathIt = ctx->cidToPath.find(nextCid);
-                if (pathIt != ctx->cidToPath.end()) {
-                    path = pathIt->second;
-                }
-                
-                processUnixFSBlock(ctx, nextCid, result.value(), path);
-                
-                // Process next item in queue after a short delay
-                auto timer = std::make_shared<boost::asio::deadline_timer>(*context_);
-                timer->expires_from_now(boost::posix_time::milliseconds(200));
-                timer->async_wait([this, ctx, timer](const boost::system::error_code& ec) {
-                    if (!ec && !ctx->timedOut) {
-                        processRequestQueue(ctx);
-                    }
-                });
-            });
+            // Legacy behavior - should not reach here in normal operation
+            logger_->error("No peer info and providers disabled for CID: {}", 
+                          libp2p::multi::ContentIdentifierCodec::toString(nextCid).value());
+            ctx->processingQueue = false;
+            if (!ctx->timedOut) {
+                ctx->callback(BitswapError::OUTBOUND_STREAM_FAILURE);
+                std::lock_guard<std::mutex> guard(mutexContentRequests_);
+                contentRequests_.erase(ctx->rootCID);
+            }
         }
     }
 
