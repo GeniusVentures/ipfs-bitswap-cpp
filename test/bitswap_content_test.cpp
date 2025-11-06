@@ -192,15 +192,25 @@ groups:
         auto cid = cid_result.value();
         std::cout << "[OK] Parsed CID successfully" << std::endl;
         
+        // Add the IPFS node as a provider for this CID
+        if (peer_info_.has_value()) {
+            std::cout << "[PROVIDER] Adding IPFS node as provider for CID" << std::endl;
+            bitswap_->AddProvider(cid, peer_info_.value());
+            std::cout << "[OK] Provider added successfully" << std::endl;
+        } else {
+            std::cerr << "[ERROR] No peer info available to add as provider" << std::endl;
+            return;
+        }
+        
         // Set up completion tracking
         bool request_completed = false;
         std::string error_message;
         UnixFSContent retrieved_content;
         
-        // Request content using our enhanced API
+        // Request content using the enhanced API (without peer parameter)
         std::cout << "[START] Starting content request..." << std::endl;
         
-        bitswap_->RequestContent(peer_info_.value(), cid, [&](libp2p::outcome::result<UnixFSContent> result) {
+        bitswap_->RequestContent(cid, [&](libp2p::outcome::result<UnixFSContent> result) {
             if (!result) {
                 error_message = result.error().message();
                 std::cerr << "[ERROR] Content request failed: " << error_message << std::endl;

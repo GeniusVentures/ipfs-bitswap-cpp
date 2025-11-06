@@ -508,14 +508,17 @@ groups:
         auto server_peer_info = server_node_->getPeerInfo();
         std::cout << "[TARGET] Server peer: " << server_peer_info.id.toBase58() << std::endl;
         
+        // Add server as provider for the published CID
+        std::cout << "[PROVIDER] Adding server as provider for directory CID" << std::endl;
+        client_node_->getBitswap()->AddProvider(published_cid_.value(), server_peer_info);
+        
         bool request_completed = false;
         bool request_success = false;
         std::string error_message;
         UnixFSContent retrieved_content;
         
-        // Request directory structure from server
+        // Request directory structure from server using provider system
         client_node_->getBitswap()->RequestContent(
-            server_peer_info, 
             published_cid_.value(), 
             [&](libp2p::outcome::result<UnixFSContent> result) {
                 if (!result) {
@@ -717,9 +720,13 @@ groups:
             bool request_complete = false;
             bool request_success = false;
             
-            // Use the correct parameter order: RequestContent(PeerInfo, CID, callback)
-            client_node_->getBitswap()->RequestContent(server_node_->getPeerInfo(),
-                individual_file_cid.value(), [&](libp2p::outcome::result<UnixFSContent> result) {
+            // Add server as provider for this individual file CID
+            std::cout << "[PROVIDER] Adding server as provider for individual file CID" << std::endl;
+            client_node_->getBitswap()->AddProvider(individual_file_cid.value(), server_node_->getPeerInfo());
+            
+            // Use the provider-based RequestContent method
+            client_node_->getBitswap()->RequestContent(individual_file_cid.value(),
+                [&](libp2p::outcome::result<UnixFSContent> result) {
                 if (result.has_value()) {
                     retrieved_content = result.value();
                     request_success = true;
