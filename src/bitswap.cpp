@@ -123,9 +123,6 @@ namespace sgns::ipfs_bitswap {
 
     void Bitswap::initialize()
     {
-        // Set logger to debug level for detailed UnixFS analysis
-        logger_->set_level(spdlog::level::debug);
-        
         // Register this bitswap instance as the protocol handler for bitswap protocol
         host_.getRouter().setProtocolHandler(getProtocolId(), 
             [weak_self = std::weak_ptr<Bitswap>(shared_from_this())](auto stream_result) {
@@ -152,7 +149,6 @@ namespace sgns::ipfs_bitswap {
 
         // Current yamux stream implementation allows to read pending data from a stream that is
         // closed for read.
-        //bool isStreamClosedForRead = stream->isClosedForRead();
         bool isStreamClosedForRead = false;
 
         if (!isStreamClosedForRead)
@@ -167,16 +163,11 @@ namespace sgns::ipfs_bitswap {
                     }
 
                     BitswapMessage msg(rmsg.value());
-                    
-                    ctx->logger_->debug("Received message: wantlist size: {}, blocks size: {}", 
-                                       msg.GetWantlistSize(), msg.GetBlocksSize());
 
                     // If we receive a message with wantlist items, we act as a server
                     // If we receive a message with blocks, we act as a client
                     bool hasWantlist = msg.GetWantlistSize() > 0;
                     bool hasBlocks = msg.GetBlocksSize() > 0;
-                    
-                    ctx->logger_->debug("Message flags: hasWantlist={}, hasBlocks={}", hasWantlist, hasBlocks);
                     
                     // Process wantlist requests (server side)
                     for (int i = 0; i < msg.GetWantlistSize(); ++i)
@@ -184,20 +175,15 @@ namespace sgns::ipfs_bitswap {
                         auto blockId = msg.GetWantlistEntry(i).block();
                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
                         if (cid) {
-                            ctx->logger_->trace("wantlist item[{}]: {}", i, libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value());
-                            
                             // Check if we have this block and respond
                             ctx->handleWantlistRequest(cid.value(), stream);
                         }
                     }
-
-                    ctx->logger_->debug("Processing {} blocks from bitswap message", msg.GetBlocksSize());
                     
                     // Process blocks (client side)
                     for (int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx)
                     {
                         const auto& block = msg.GetBlock(blockIdx);
-                        ctx->logger_->debug("Block received ({} bytes)", block.size());
 
                         auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(block.data(), block.size());
                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)cidV0.data(), cidV0.size()));
@@ -208,16 +194,12 @@ namespace sgns::ipfs_bitswap {
                         else
                         {
                             auto scid = libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value();
-                            ctx->logger_->debug("Block CID: {}", scid);
 
                             std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
-                            ctx->logger_->debug("Currently have {} request contexts", ctx->requestContexts_.size());
                             
                             auto itContext = ctx->requestContexts_.find(cid.value());
                             if (itContext != ctx->requestContexts_.end())
                             {
-                                ctx->logger_->debug("Found matching request context for CID: {}, calling HandleResponse", scid);
-                                
                                 // Mark provider success
                                 if (auto remotePeer = stream->remotePeerId()) {
                                     ctx->markProviderSuccess(cid.value(), remotePeer.value());
@@ -228,13 +210,6 @@ namespace sgns::ipfs_bitswap {
                             else
                             {
                                 ctx->logger_->warn("No request context found for received block CID: {}", scid);
-                                // Debug: List all current request contexts
-                                for (const auto& [reqCid, reqCtx] : ctx->requestContexts_) {
-                                    auto reqCidStr = libp2p::multi::ContentIdentifierCodec::toString(reqCid);
-                                    if (reqCidStr) {
-                                        ctx->logger_->debug("  Available request context CID: {}", reqCidStr.value());
-                                    }
-                                }
                             }
                         }
                     }
@@ -242,7 +217,6 @@ namespace sgns::ipfs_bitswap {
                     // Set up continuous reading based on what we received
                     if (hasWantlist && !hasBlocks) {
                         // We're a server that received a wantlist - set up continuous reading
-                        ctx->logger_->debug("Server side: processed wantlist, setting up continuous read for subsequent requests");
                         
                         // Lambda function for recursive server reading
                         std::function<void()> setupServerRead = [ctx, stream, rw, setupServerRead = std::shared_ptr<std::function<void()>>(new std::function<void()>)]() mutable {
@@ -250,34 +224,24 @@ namespace sgns::ipfs_bitswap {
                                 rw->read<bitswap_pb::Message>(
                                     [ctx, stream, rw, setupServerRead](libp2p::outcome::result<bitswap_pb::Message> nextMsg) {
                                         if (nextMsg) {
-                                            ctx->logger_->debug("Server received continuous request, processing...");
                                             BitswapMessage nextBitswapMsg(nextMsg.value());
-                                            
-                                            // Process the received message
-                                            ctx->logger_->debug("Received message: wantlist size: {}, blocks size: {}", 
-                                                               nextBitswapMsg.GetWantlistSize(), nextBitswapMsg.GetBlocksSize());
                                             
                                             bool nextHasWantlist = nextBitswapMsg.GetWantlistSize() > 0;
                                             bool nextHasBlocks = nextBitswapMsg.GetBlocksSize() > 0;
-                                            ctx->logger_->debug("Message flags: hasWantlist={}, hasBlocks={}", nextHasWantlist, nextHasBlocks);
                                             
                                             // Process wantlist requests (server side)
                                             for (int i = 0; i < nextBitswapMsg.GetWantlistSize(); ++i) {
                                                 auto blockId = nextBitswapMsg.GetWantlistEntry(i).block();
                                                 auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)blockId.data(), blockId.size()));
                                                 if (cid) {
-                                                    ctx->logger_->trace("wantlist item[{}]: {}", i, libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value());
                                                     ctx->handleWantlistRequest(cid.value(), stream);
                                                 }
                                             }
                                             
                                             // Continue reading for more requests
                                             if (nextHasWantlist && !nextHasBlocks) {
-                                                ctx->logger_->debug("Server side: processed wantlist, continuing continuous read loop");
                                                 (*setupServerRead)();
                                             }
-                                        } else {
-                                            ctx->logger_->debug("Server continuous read ended: {}", nextMsg.error().message());
                                         }
                                     });
                             };
@@ -287,30 +251,23 @@ namespace sgns::ipfs_bitswap {
                         setupServerRead();
                     } else if (!hasWantlist && !hasBlocks) {
                         // We're a client that sent a wantlist and haven't received blocks yet
-                        ctx->logger_->debug("Client side: setting up read for block response");
                         rw->read<bitswap_pb::Message>(
                             [ctx, stream, rw](libp2p::outcome::result<bitswap_pb::Message> nextMsg) {
-                                ctx->logger_->debug("Client attempting to read response message...");
                                 if (nextMsg) {
                                     BitswapMessage nextBitswapMsg(nextMsg.value());
-                                    ctx->logger_->debug("Client received response with {} blocks", nextBitswapMsg.GetBlocksSize());
                                     
                                     // Process blocks in the response
                                     for (int blockIdx = 0; blockIdx < nextBitswapMsg.GetBlocksSize(); ++blockIdx) {
                                         const auto& block = nextBitswapMsg.GetBlock(blockIdx);
-                                        ctx->logger_->debug("Response block received ({} bytes)", block.size());
 
                                         auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(block.data(), block.size());
                                         auto cid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)cidV0.data(), cidV0.size()));
                                         if (cid) {
                                             auto scid = libp2p::multi::ContentIdentifierCodec::toString(cid.value()).value();
-                                            ctx->logger_->debug("Response block CID: {}", scid);
 
                                             std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
                                             auto itContext = ctx->requestContexts_.find(cid.value());
                                             if (itContext != ctx->requestContexts_.end()) {
-                                                ctx->logger_->debug("Found matching request context for response CID: {}", scid);
-                                                
                                                 // Mark provider success
                                                 if (auto remotePeer = stream->remotePeerId()) {
                                                     ctx->markProviderSuccess(cid.value(), remotePeer.value());
@@ -320,12 +277,8 @@ namespace sgns::ipfs_bitswap {
                                             }
                                         }
                                     }
-                                } else {
-                                    ctx->logger_->debug("Client read failed: {}", nextMsg.error().message());
                                 }
                             });
-                    } else {
-                        ctx->logger_->debug("Message processed: wantlist={}, blocks={}", hasWantlist, hasBlocks);
                     }
                 });
         }
@@ -365,18 +318,6 @@ namespace sgns::ipfs_bitswap {
         {
             return;
         }
-
-        //auto remote_peer_addr_res = conn.lock()->remoteMultiaddr();
-        //if (!remote_peer_addr_res)
-        //{
-        //    return;
-        //}
-
-        //libp2p::peer::PeerInfo peer_info
-        //{
-        //    std::move(remote_peer_res.value()),
-        //    std::vector<libp2p::multi::Multiaddress>{ std::move(remote_peer_addr_res.value())} 
-        //};
 
         logger_->debug("connected to peer {}", remote_peer_res.value().toBase58());
     }
@@ -421,8 +362,6 @@ namespace sgns::ipfs_bitswap {
             return;
         }
 
-        logger_->info("successfully written a bitswap message message to peer: {}", writtenBytes.value());
-
         std::lock_guard<std::mutex> callbacksGuard(mutexRequestCallbacks_);
         auto itCallbacks = requestContexts_.find(cid);
         if (itCallbacks != requestContexts_.end())
@@ -438,31 +377,23 @@ namespace sgns::ipfs_bitswap {
         }
         // Set up read operation to listen for server response
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
-        logger_->debug("Client setting up read operation for server response to CID: {}", cidToString(cid));
         rw->read<bitswap_pb::Message>(
             [ctx = shared_from_this(), stream, cid](libp2p::outcome::result<bitswap_pb::Message> responseMsg) {
-                ctx->logger_->debug("Client attempting to read response message for CID: {}", cidToString(cid));
                 if (responseMsg) {
                     BitswapMessage responseBitswapMsg(responseMsg.value());
-                    ctx->logger_->debug("Client received response with {} blocks for CID: {}", 
-                                       responseBitswapMsg.GetBlocksSize(), cidToString(cid));
                     
                     // Process blocks in the response
                     for (int blockIdx = 0; blockIdx < responseBitswapMsg.GetBlocksSize(); ++blockIdx) {
                         const auto& block = responseBitswapMsg.GetBlock(blockIdx);
-                        ctx->logger_->debug("Client response block received ({} bytes)", block.size());
 
                         auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(block.data(), block.size());
                         auto blockCid = libp2p::multi::ContentIdentifierCodec::decode(gsl::span((uint8_t*)cidV0.data(), cidV0.size()));
                         if (blockCid) {
                             auto scid = libp2p::multi::ContentIdentifierCodec::toString(blockCid.value()).value();
-                            ctx->logger_->debug("Client response block CID: {}", scid);
 
                             std::lock_guard<std::mutex> callbacksGuard(ctx->mutexRequestCallbacks_);
                             auto itContext = ctx->requestContexts_.find(blockCid.value());
                             if (itContext != ctx->requestContexts_.end()) {
-                                ctx->logger_->debug("Client found matching request context for response CID: {}", scid);
-                                
                                 // Mark provider success
                                 if (auto remotePeer = stream->remotePeerId()) {
                                     ctx->markProviderSuccess(blockCid.value(), remotePeer.value());
@@ -474,13 +405,10 @@ namespace sgns::ipfs_bitswap {
                             }
                         }
                     }
-                } else {
-                    ctx->logger_->debug("Client read failed for CID {}: {}", cidToString(cid), responseMsg.error().message());
                 }
             });
 
         // Keep stream open for reuse - don't close it
-        logger_->debug("stream kept open for reuse");
     }
 
     void Bitswap::RequestContent(
@@ -488,8 +416,6 @@ namespace sgns::ipfs_bitswap {
         const CID& cid,
         ContentCallback onContentCallback)
     {
-        logger_->debug("RequestContent called for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
-
         auto ctx = std::make_shared<ContentRequestContext>(*context_, cid);
         ctx->peerInfo = pi;  // Store peer info for additional requests
         ctx->callback = std::move(onContentCallback);
@@ -532,8 +458,6 @@ namespace sgns::ipfs_bitswap {
         const CID& cid,
         ContentCallback onContentCallback)
     {
-        logger_->debug("RequestContent (auto-select peer) called for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
-
         auto ctx = std::make_shared<ContentRequestContext>(*context_, cid);
         ctx->callback = std::move(onContentCallback);
         ctx->useProviders = true;  // Enable provider-based requests
@@ -562,8 +486,6 @@ namespace sgns::ipfs_bitswap {
         try {
             auto selectedPeer = selectBestProvider(cid);
             ctx->peerInfo = selectedPeer;  // Store the selected peer for subsequent requests
-            logger_->debug("Selected peer {} for content request CID: {}", 
-                          selectedPeer.id.toBase58(), libp2p::multi::ContentIdentifierCodec::toString(cid).value());
             
             RequestBlock(selectedPeer, cid, [this, ctx](libp2p::outcome::result<std::string> blockResult) {
                 if (!blockResult) {
@@ -679,10 +601,6 @@ namespace sgns::ipfs_bitswap {
                     else
                     {
                         auto stream = rstream.value();
-                        if (retryCount > 0) {
-                            ctx->logger_->info("Stream creation succeeded on retry {} for peer {}", 
-                                             retryCount + 1, pi.id.toBase58());
-                        }
                         ctx->logStreamState("outbound stream created", *stream);
                         
                         // Cache the stream for reuse
@@ -720,12 +638,8 @@ namespace sgns::ipfs_bitswap {
             return; // Don't process if already timed out
         }
 
-        logger_->set_level(spdlog::level::trace);
-        logger_->debug("Processing UnixFS block for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
-
         // Check if we've already processed this CID to prevent duplicates
         if (ctx->completedCIDs.find(cid) != ctx->completedCIDs.end()) {
-            logger_->debug("CID already processed, skipping: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
             return;
         }
 
@@ -739,8 +653,6 @@ namespace sgns::ipfs_bitswap {
             // This is a file chunk
             const CID& parentCid = chunkIt->second.parentCid.value();
             size_t chunkIndex = chunkIt->second.chunkIndex;
-            logger_->debug("Processing as chunk {} for file CID: {}", chunkIndex, 
-                          libp2p::multi::ContentIdentifierCodec::toString(parentCid).value());
             handleFileChunk(ctx, cid, blockData, chunkIndex, parentCid);
             checkContentRequestComplete(ctx);
             return;
@@ -759,49 +671,12 @@ namespace sgns::ipfs_bitswap {
             return;
         }
 
-        // ===== CID CALCULATION COMPARISON WITH KUBO =====
-        // Test if our CID calculation method matches Kubo's by applying it to Kubo's raw IPLD data
-        {
-            std::vector<uint8_t> kuboBlockData(blockData.begin(), blockData.end());
-            auto kuboCidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(kuboBlockData.data(), kuboBlockData.size());
-            
-            if (!kuboCidBytes.empty()) {
-                auto kuboCidDecoded = libp2p::multi::ContentIdentifierCodec::decode(
-                    gsl::span(reinterpret_cast<const uint8_t*>(kuboCidBytes.data()), kuboCidBytes.size())
-                );
-                if (kuboCidDecoded) {
-                    auto kuboCidString = libp2p::multi::ContentIdentifierCodec::toString(kuboCidDecoded.value());
-                    auto expectedCidString = libp2p::multi::ContentIdentifierCodec::toString(cid);
-                    
-                    logger_->debug("=== CID CALCULATION TEST ===");
-                    logger_->debug("Expected CID: {}", expectedCidString.value());
-                    logger_->debug("Kubo IPLD data -> our CID calc: {}", kuboCidString.value());
-                    logger_->debug("CIDs match: {}", (kuboCidDecoded.value() == cid ? "YES" : "NO"));
-                    logger_->debug("Kubo IPLD data size: {} bytes", kuboBlockData.size());
-                    
-                    // Log raw Kubo IPLD node bytes for direct comparison
-                    std::ostringstream kuboHex;
-                    for (size_t i = 0; i < std::min(kuboBlockData.size(), static_cast<size_t>(100)); ++i) {
-                        kuboHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)kuboBlockData[i] << " ";
-                    }
-                    logger_->debug("Kubo IPLD node first 100 bytes (hex): {}", kuboHex.str());
-                    logger_->debug("=== END CID TEST ===");
-                } else {
-                    logger_->debug("Failed to decode CID calculated from Kubo IPLD data");
-                }
-            } else {
-                logger_->debug("Failed to calculate CID from Kubo IPLD data");
-            }
-        }
-
         // Process any links (additional CIDs to fetch)
         auto links = decoder.getLinks();
         for (const auto& link : links) {
             if (ctx->completedCIDs.find(link.cid) == ctx->completedCIDs.end()) {
                 // We haven't processed this CID yet
                 ctx->pendingCIDs.insert(link.cid);
-                
-                logger_->debug("Found linked CID: {}, queuing...", libp2p::multi::ContentIdentifierCodec::toString(link.cid).value());
                 
                 // Add to queue instead of making immediate request
                 ctx->requestQueue.push(link.cid);
@@ -820,61 +695,6 @@ namespace sgns::ipfs_bitswap {
             }
             return;
         }
-        logger_->set_level(spdlog::level::debug);
-        // ===== DETAILED LOGGING FOR KUBO UNIXFS STRUCTURE ANALYSIS =====
-        auto cidString = libp2p::multi::ContentIdentifierCodec::toString(cid);
-        logger_->debug("==== KUBO UnixFS Analysis for CID: {} ====", cidString ? cidString.value() : "invalid");
-        logger_->debug("UnixFS Type: {}", static_cast<int>(unixfsData.type()));
-        logger_->debug("Has data field: {}", unixfsData.has_data());
-        if (unixfsData.has_data()) {
-            logger_->debug("Data field size: {} bytes", unixfsData.data().size());
-        }
-        logger_->debug("Has filesize field: {}", unixfsData.has_filesize());
-        if (unixfsData.has_filesize()) {
-            logger_->debug("Filesize: {} bytes", unixfsData.filesize());
-        }
-        logger_->debug("Has mode field: {}", unixfsData.has_mode());
-        if (unixfsData.has_mode()) {
-            logger_->debug("mode: {} ", unixfsData.mode());
-        }
-        logger_->debug("Has time field: {}", unixfsData.has_mtime());
-        logger_->debug("Has fanout field: {}", unixfsData.has_fanout());
-        logger_->debug("Has type field: {}", unixfsData.has_type());
-        // if (unixfsData.has_mtime()) {
-        //     logger_->debug("mtime: {} ", unixfsData.mtime());
-        // }
-        logger_->debug("Blocksizes count: {}", unixfsData.blocksizes_size());
-        for (int i = 0; i < unixfsData.blocksizes_size(); ++i) {
-            logger_->debug("  Blocksize[{}]: {} bytes", i, unixfsData.blocksizes(i));
-        }
-        logger_->debug("IPLD Links count: {}", links.size());
-        for (size_t i = 0; i < links.size(); ++i) {
-            const auto& link = links[i];
-            auto subcidString = libp2p::multi::ContentIdentifierCodec::toString(link.cid);
-            std::string cidStr = subcidString ? subcidString.value() : "invalid";
-            logger_->debug("  Link[{}]: name='{}' -> CID='{}' size='{}'", i, link.name, cidStr, link.size);
-            
-            // Log raw link CID bytes for comparison
-            auto cidBytes = libp2p::multi::ContentIdentifierCodec::encode(link.cid);
-            if (cidBytes.has_value()) {
-                std::ostringstream linkHex;
-                for (size_t j = 0; j < cidBytes.value().size(); ++j) {
-                    linkHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)cidBytes.value()[j] << " ";
-                }
-                logger_->debug("    Kubo Link[{}] CID bytes (hex): {}", i, linkHex.str());
-            }
-        }
-        
-        // Log raw UnixFS protobuf data for comparison
-        size_t serializedSize = unixfsData.ByteSizeLong();
-        std::vector<uint8_t> serializedUnixFS(serializedSize);
-        unixfsData.SerializeToArray(serializedUnixFS.data(), static_cast<int>(serializedSize));
-        std::ostringstream hexStream;
-        for (unsigned char c : serializedUnixFS) {
-            hexStream << std::hex << std::setfill('0') << std::setw(2) << (unsigned)c << " ";
-        }
-        logger_->debug("Raw UnixFS protobuf (hex): {}", hexStream.str());
-        logger_->debug("==== End Kubo UnixFS Analysis ====");
 
         // Handle different UnixFS data types
         switch (unixfsData.type()) {
@@ -907,7 +727,6 @@ namespace sgns::ipfs_bitswap {
             auto pathIt = ctx->cidToPath.find(cid);
             if (pathIt != ctx->cidToPath.end()) {
                 filePath = pathIt->second;
-                logger_->debug("Found path for CID in cidToPath: {}", filePath);
             }
         }
         
@@ -927,16 +746,13 @@ namespace sgns::ipfs_bitswap {
                 }
 
                 ctx->collectedFiles.push_back(std::move(file));
-                logger_->debug("Complete file collected: {} ({} bytes)", filePath, file.size);
             }
         } else {
             // This file has multiple chunks - set up for chunk assembly
             auto links = decoder.getLinks();
-            logger_->debug("Multi-chunk file detected: {} with {} chunks", filePath, links.size());
             
             // Check if we already have this file in progress to prevent duplicates
             if (ctx->filesInProgress.find(cid) != ctx->filesInProgress.end()) {
-                logger_->debug("File already in progress, skipping duplicate setup: {}", filePath);
                 return;
             }
             
@@ -960,7 +776,6 @@ namespace sgns::ipfs_bitswap {
                     std::make_optional(cid)
                 };
                 fileProgress.chunks[0] = std::move(chunk);
-                logger_->debug("Stored root chunk 0 ({} bytes)", chunk.data.size());
             }
             
             // Request all linked chunks
@@ -971,8 +786,6 @@ namespace sgns::ipfs_bitswap {
                     ctx->pendingCIDs.insert(link.cid);
                     ctx->cidToPath[link.cid] = filePath; // Track which file this chunk belongs to
                     ctx->chunkToCidIndex[link.cid] = ContentRequestContext::ChunkInfo(cid, i); // Track this is chunk i of file cid
-                    
-                    logger_->debug("Requesting file chunk {} for {}", i + 1, filePath);
                     
                     // Add to queue instead of making immediate request
                     ctx->requestQueue.push(link.cid);
@@ -1025,27 +838,11 @@ namespace sgns::ipfs_bitswap {
         if (dataOpt && unixfsData.ParseFromArray(dataOpt->data(), static_cast<int>(dataOpt->size())) && unixfsData.has_data()) {
             // This chunk contains UnixFS wrapped data
             chunkContent = std::vector<char>(unixfsData.data().begin(), unixfsData.data().end());
-            logger_->debug("Decoded UnixFS chunk {} for {} ({} bytes)", chunkIndex, fileProgress.path, chunkContent.size());
-            
-            // For first chunk, log some raw data comparison
-            if (chunkIndex == 0) {
-                std::stringstream hex_stream;
-                for (size_t i = 0; i < std::min(chunkContent.size(), static_cast<size_t>(32)); ++i) {
-                    hex_stream << std::hex << std::setfill('0') << std::setw(2) 
-                              << static_cast<unsigned>(static_cast<unsigned char>(chunkContent[i])) << " ";
-                }
-                logger_->debug("Kubo chunk 0 first 32 bytes (hex): {}", hex_stream.str());
-            }
-            logger_->debug("Chunk {} UnixFS filesize field present: {}", chunkIndex, unixfsData.has_filesize());
-            logger_->debug("Chunk {} UnixFS mode field present: {}", chunkIndex, unixfsData.has_mode());
-            logger_->debug("Chunk {} UnixFS mtime field present: {}", chunkIndex, unixfsData.has_mtime());
-            logger_->debug("Chunk {} UnixFS type field present: {}", chunkIndex, unixfsData.has_type());
         } else {
             // This might be raw data
             if (dataOpt) {
                 chunkContent = std::vector<char>(dataOpt->begin(), dataOpt->end());
             }
-            logger_->debug("Decoded raw chunk {} for {} ({} bytes)", chunkIndex, fileProgress.path, chunkContent.size());
         }
         
         // Store the chunk
@@ -1060,9 +857,6 @@ namespace sgns::ipfs_bitswap {
         if (chunkIndex + 1 > fileProgress.expectedChunks) {
             fileProgress.expectedChunks = chunkIndex + 1;
         }
-        
-        logger_->debug("Stored chunk {} for file {} ({}/{} chunks)", 
-                      chunkIndex, fileProgress.path, fileProgress.chunks.size(), fileProgress.expectedChunks);
         
         // Check if we have all chunks for this file
         if (fileProgress.chunks.size() >= fileProgress.expectedChunks) {
@@ -1129,7 +923,6 @@ namespace sgns::ipfs_bitswap {
     void Bitswap::handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const MerkledagDecoder& decoder, const std::string& basePath)
     {
         auto links = decoder.getLinks();
-        logger_->debug("Processing directory block with {} entries, basePath: '{}'", links.size(), basePath);
         
         // Directory blocks contain links to their contents
         for (const auto& link : links) {
@@ -1143,7 +936,6 @@ namespace sgns::ipfs_bitswap {
             
             // Check if we've already processed this CID
             if (ctx->completedCIDs.find(link.cid) != ctx->completedCIDs.end()) {
-                logger_->debug("Already processed CID for {}, skipping", childPath);
                 continue;
             }
             
@@ -1152,21 +944,15 @@ namespace sgns::ipfs_bitswap {
             
             // Check if we're already processing this CID
             if (ctx->pendingCIDs.find(link.cid) != ctx->pendingCIDs.end()) {
-                logger_->debug("Already pending CID for {}, skipping duplicate", childPath);
                 continue;
             }
             
             // Add to pending
             ctx->pendingCIDs.insert(link.cid);
             
-            logger_->debug("Requesting directory entry: {} -> {}", childPath, 
-                          libp2p::multi::ContentIdentifierCodec::toString(link.cid).value());
-            
             // Add to request queue instead of making direct request
             ctx->requestQueue.push(link.cid);
         }
-        
-        logger_->debug("Directory block processed: {} entries queued for processing", links.size());
         
         // Process the queued directory entries
         processRequestQueue(ctx);
@@ -1187,9 +973,6 @@ namespace sgns::ipfs_bitswap {
             
             std::lock_guard<std::mutex> guard(mutexContentRequests_);
             contentRequests_.erase(ctx->rootCID);
-        } else {
-            logger_->debug("Content request not complete: {} pending CIDs, {} files in progress", 
-                          ctx->pendingCIDs.size(), ctx->filesInProgress.size());
         }
     }
 
@@ -1200,10 +983,8 @@ namespace sgns::ipfs_bitswap {
         // Determine content type based on collected files
         if (ctx->collectedFiles.empty()) {
             content.type = UnixFSContent::DIRECTORY;
-            logger_->debug("Assembled empty directory");
         } else if (ctx->collectedFiles.size() == 1 && ctx->collectedFiles[0].path.empty()) {
             content.type = UnixFSContent::SINGLE_FILE;
-            logger_->debug("Assembled single file: {} bytes", ctx->collectedFiles[0].content.size());
         } else {
             // Multiple files or files with paths - this is a directory structure
             bool hasDirectoryStructure = false;
@@ -1215,9 +996,6 @@ namespace sgns::ipfs_bitswap {
             }
             
             content.type = hasDirectoryStructure ? UnixFSContent::MULTI_FILE_ARCHIVE : UnixFSContent::DIRECTORY;
-            logger_->debug("Assembled {} with {} files", 
-                          (content.type == UnixFSContent::MULTI_FILE_ARCHIVE ? "multi-file archive" : "directory"),
-                          ctx->collectedFiles.size());
         }
         
         // Move files to content
@@ -1262,9 +1040,6 @@ namespace sgns::ipfs_bitswap {
                 if (!result) {
                     // If same-peer request failed and we're using providers, try provider system as fallback
                     if (ctx->useProviders) {
-                        logger_->debug("Same-peer request failed for CID: {}, trying provider system as fallback using root CID providers", 
-                                      libp2p::multi::ContentIdentifierCodec::toString(nextCid).value());
-                        
                         requestBlockWithProvidersFromRoot(ctx->rootCID, nextCid, [this, ctx, nextCid](libp2p::outcome::result<std::string> fallbackResult) {
                             if (!fallbackResult) {
                                 if (!ctx->timedOut) {
@@ -1393,8 +1168,6 @@ namespace sgns::ipfs_bitswap {
         file.read(reinterpret_cast<char*>(content.data()), fileSize);
         file.close();
 
-        logger_->debug("Read file: {} ({} bytes)", filePath, fileSize);
-
         // For large files, we should implement chunking
         // For now, handle files up to a reasonable size as single blocks
         const size_t CHUNK_SIZE = 256 * 1024; // 256KB chunks
@@ -1417,26 +1190,6 @@ namespace sgns::ipfs_bitswap {
         return hexStream.str();
     }
 
-    void Bitswap::analyzeIPLDStructure(const std::vector<uint8_t>& data, const std::string& label)
-    {
-        logger_->debug("=== IPLD Structure Analysis: {} ===", label);
-        logger_->debug("Total size: {} bytes", data.size());
-        
-        // Analyze protobuf structure
-        if (data.size() > 10) {
-            for (size_t i = 0; i < std::min(size_t(20), data.size()); ++i) {
-                uint8_t byte = data[i];
-                uint8_t tag = (byte >> 3) & 0x1F;
-                uint8_t wireType = byte & 0x07;
-                
-                if (wireType <= 5) { // Valid wire types
-                    logger_->debug("Byte {}: 0x{:02X} (tag={}, wire_type={})", i, byte, tag, wireType);
-                }
-            }
-        }
-        logger_->debug("=== End Analysis ===");
-    }
-
     CID Bitswap::encodeChunkedFile(const std::vector<uint8_t>& content, const std::string& filePath)
     {
         const size_t CHUNK_SIZE = 256 * 1024; // 256KB chunks
@@ -1447,16 +1200,6 @@ namespace sgns::ipfs_bitswap {
         for (size_t offset = 0; offset < content.size(); offset += CHUNK_SIZE) {
             size_t rawChunkSize = std::min(CHUNK_SIZE, content.size() - offset);
             std::vector<uint8_t> chunk(content.begin() + offset, content.begin() + offset + rawChunkSize);
-            
-            // For first chunk, log some raw data comparison
-            if (offset == 0) {
-                std::stringstream hex_stream;
-                for (size_t i = 0; i < std::min(chunk.size(), static_cast<size_t>(32)); ++i) {
-                    hex_stream << std::hex << std::setfill('0') << std::setw(2) 
-                              << static_cast<unsigned>(chunk[i]) << " ";
-                }
-                logger_->debug("Our chunk 0 first 32 bytes (hex): {}", hex_stream.str());
-            }
             
             // Store chunk with UnixFS wrapper (File type to match Kubo)
             CID chunkCID = createIPLDNodeAndStoreRawData(chunk);
@@ -1481,44 +1224,12 @@ namespace sgns::ipfs_bitswap {
         
         // Do NOT set data field for chunked files (only blocksizes and links)
 
-        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
-        // size_t serializedSize = unixfsData.ByteSizeLong();
-        // std::vector<uint8_t> serializedUnixFS(serializedSize);
+        // Serialize UnixFS data using SerializeToString
         std::string serializedUnixFS;
         if (!unixfsData.SerializeToString(&serializedUnixFS)) {
             logger_->error("Failed to serialize UnixFS data for chunked file: {}", filePath);
             throw std::runtime_error("Failed to serialize UnixFS data for chunked file: " + filePath);
         }
-
-        // ===== DETAILED LOGGING FOR CHUNKED FILE ROOT =====
-        logger_->debug("==== Our Chunked File Root UnixFS ====");
-        logger_->debug("File: {}", filePath);
-        logger_->debug("Total file size: {} bytes", content.size());
-        logger_->debug("Number of chunks: {}", chunkCIDs.size());
-        logger_->debug("UnixFS Type: {}", static_cast<int>(unixfsData.type()));
-        logger_->debug("Has data field: {} (should be false for chunked files)", unixfsData.has_data());
-        logger_->debug("Has filesize field: {}", unixfsData.has_filesize());
-        if (unixfsData.has_filesize()) {
-            logger_->debug("Filesize: {} bytes", unixfsData.filesize());
-        }
-        logger_->debug("Blocksizes count: {}", unixfsData.blocksizes_size());
-        for (int i = 0; i < unixfsData.blocksizes_size(); ++i) {
-            logger_->debug("  Blocksize[{}]: {} bytes", i, unixfsData.blocksizes(i));
-        }
-        
-        // Log chunk CIDs
-        for (size_t i = 0; i < chunkCIDs.size(); ++i) {
-            auto chunkCidString = libp2p::multi::ContentIdentifierCodec::toString(chunkCIDs[i]);
-            logger_->debug("  Chunk[{}] CID: {}", i, chunkCidString ? chunkCidString.value() : "invalid");
-        }
-        
-        // Log raw UnixFS protobuf data for root node
-        std::ostringstream hexStream;
-        for (unsigned char c : serializedUnixFS) {
-            hexStream << std::hex << std::setfill('0') << std::setw(2) << (unsigned)c << " ";
-        }
-        logger_->debug("Chunked file root UnixFS protobuf (hex): {}", hexStream.str());
-        logger_->debug("==== End Chunked File Root UnixFS ====");
 
         // Create root IPLD node with ordered chunk CIDs (preserves order and allows duplicate empty names)
         // We'll calculate the total size after the root node is created
@@ -1542,17 +1253,8 @@ namespace sgns::ipfs_bitswap {
                 totalSizeWithOverhead += rootIt->second.size;
                 // Update the contentSize to the total including all overhead
                 rootIt->second.contentSize = totalSizeWithOverhead;
-                
-                logger_->debug("Updated chunked file total contentSize: raw={}, withOverhead={}", 
-                              content.size(), totalSizeWithOverhead);
             }
         }
-        
-        logger_->debug("Created chunked file with {} chunks, root CID: {}", 
-                      chunkCIDs.size(), 
-                      libp2p::multi::ContentIdentifierCodec::toString(rootCID).has_value() 
-                          ? libp2p::multi::ContentIdentifierCodec::toString(rootCID).value() 
-                          : "invalid");
         
         return rootCID;
     }
@@ -1590,7 +1292,6 @@ namespace sgns::ipfs_bitswap {
                 
                 if (!entryCID.content_address.toBuffer().empty()) {
                     links.emplace(entryName, entryCID);
-                    logger_->debug("Added directory entry: {} -> {}", entryName, cidToString(entryCID));
                 }
             } catch (const std::exception& e) {
                 logger_->warn("Failed to process directory entry {}: {}", entry.path().string(), e.what());
@@ -1598,28 +1299,11 @@ namespace sgns::ipfs_bitswap {
             }
         }
 
-        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
-        // size_t serializedSize = unixfsData.ByteSizeLong();
-        // std::vector<uint8_t> serializedUnixFS(serializedSize);
+        // Serialize UnixFS data using SerializeToString
         std::string serializedUnixFS;
         if (!unixfsData.SerializeToString(&serializedUnixFS)) {
             logger_->error("Failed to serialize UnixFS data for directory: {}", directoryPath);
             throw std::runtime_error("Failed to serialize UnixFS data for directory: " + directoryPath);
-        }
-
-        // Debug: Show all directory links before creating IPLD node
-        logger_->debug("Creating directory IPLD node with {} links:", links.size());
-        for (const auto& [linkName, linkCid] : links) {
-            // Look up tsize for this link to show in debug
-            size_t linkTsize = 0;
-            {
-                std::lock_guard<std::mutex> guard(mutexBlockStore_);
-                auto it = blockStore_.find(linkCid);
-                if (it != blockStore_.end()) {
-                    linkTsize = it->second.size;
-                }
-            }
-            logger_->debug("  - Link: '{}' -> CID {} (tsize={})", linkName, cidToString(linkCid), linkTsize);
         }
 
         // Calculate total content size for this directory (sum of all content within)
@@ -1645,13 +1329,8 @@ namespace sgns::ipfs_bitswap {
                 // Include the directory's own IPLD size in its content size (like Kubo does)
                 size_t finalContentSize = totalDirectoryContentSize + it->second.size;
                 it->second.contentSize = finalContentSize;
-                logger_->debug("Updated directory CID {} contentSize: children={} + self={} = {} bytes", 
-                              cidToString(dirCID), totalDirectoryContentSize, it->second.size, finalContentSize);
             }
         }
-        
-        logger_->debug("Created directory with {} entries, CID: {}, total content size: {} bytes", 
-                      links.size(), cidToString(dirCID), totalDirectoryContentSize);
         
         return dirCID;
     }
@@ -1663,10 +1342,6 @@ namespace sgns::ipfs_bitswap {
         
         // Create IPLD node to calculate the CID, but store the UnixFS data for bitswap
         CID cid = createIPLDNodeAndStoreUnixFS(unixfsData);
-        
-        if (!cid.content_address.toBuffer().empty()) {
-            logger_->debug("Encoded and stored {} bytes as CID: {}", data.size(), cidToString(cid));
-        }
         
         return cid;
     }
@@ -1693,37 +1368,12 @@ namespace sgns::ipfs_bitswap {
             // For now, we'll handle this in the chunked file method
         }
 
-        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
-        //size_t serializedSize = unixfsData.ByteSizeLong();
+        // Serialize UnixFS data using SerializeToString
         std::string serialized;
         if (!unixfsData.SerializeToString(&serialized)) {
             logger_->error("Failed to serialize UnixFS data");
             return {};
         }
-
-        // ===== DETAILED LOGGING FOR OUR UNIXFS CREATION =====
-        logger_->debug("==== Our UnixFS Creation ====");
-        logger_->debug("Creating UnixFS Type: {}", static_cast<int>(unixfsData.type()));
-        logger_->debug("Has data field: {}", unixfsData.has_data());
-        if (unixfsData.has_data()) {
-            logger_->debug("Data field size: {} bytes", unixfsData.data().size());
-        }
-        logger_->debug("Has filesize field: {}", unixfsData.has_filesize());
-        if (unixfsData.has_filesize()) {
-            logger_->debug("Filesize: {} bytes", unixfsData.filesize());
-        }
-        logger_->debug("Blocksizes count: {}", unixfsData.blocksizes_size());
-        for (int i = 0; i < unixfsData.blocksizes_size(); ++i) {
-            logger_->debug("  Blocksize[{}]: {} bytes", i, unixfsData.blocksizes(i));
-        }
-        
-        // Log raw UnixFS protobuf data for comparison
-        std::ostringstream hexStream;
-        for (unsigned char c : serialized) {
-            hexStream << std::hex << std::setfill('0') << std::setw(2) << (unsigned)c << " ";
-        }
-        logger_->debug("Our raw UnixFS protobuf (hex): {}", hexStream.str());
-        logger_->debug("==== End Our UnixFS Creation ====");
 
         return serialized;
     }
@@ -1749,23 +1399,11 @@ namespace sgns::ipfs_bitswap {
                         // For file links, this will be the actual file size (5040065 for model.mnn)
                         // For directory links, this will be the sum of all content within
                         link.tsize = it->second.contentSize;
-                        logger_->debug("DIRECTORY LINK: {} -> CID {}: tsize={} bytes (contentSize)", 
-                                     name, 
-                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value(), 
-                                     link.tsize);
                     } else {
                         link.tsize = 0; // Fallback if not found in block store
                         logger_->warn("DIRECTORY LINK MISSING: {} -> CID {} NOT FOUND in block store (using tsize=0)", 
                                     name,
                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value());
-                        
-                        // Debug: List all CIDs in block store
-                        logger_->debug("Current block store contains {} entries:", blockStore_.size());
-                        for (const auto& [storedCid, block] : blockStore_) {
-                            logger_->debug("  - CID {}: {} bytes", 
-                                         libp2p::multi::ContentIdentifierCodec::toString(storedCid).value(),
-                                         block.size);
-                        }
                     }
                 }
                 
@@ -1817,9 +1455,6 @@ namespace sgns::ipfs_bitswap {
                     auto it = blockStore_.find(cid);
                     if (it != blockStore_.end()) {
                         link.tsize = it->second.size; // Total serialized IPLD size including UnixFS wrapper
-                        logger_->debug("Setting tsize for link to CID {}: {} bytes", 
-                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value(), 
-                                     link.tsize);
                     } else {
                         link.tsize = 0; // Fallback if not found in block store
                         logger_->warn("Could not find block size for CID {} in block store", 
@@ -1831,71 +1466,8 @@ namespace sgns::ipfs_bitswap {
             }
         }
         
-        // ===== DEBUG: LOG UNIXFS DATA AND LINKS BEFORE ENCODING =====
-        logger_->debug("=== DETAILED ENCODING DEBUG ===");
-        logger_->debug("UnixFS data size: {} bytes", unixfsData.size());
-        
-        // Log UnixFS data hex
-        std::ostringstream unixfsHex;
-        for (size_t i = 0; i < unixfsData.size(); ++i) {
-            unixfsHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)unixfsData[i] << " ";
-        }
-        logger_->debug("UnixFS data (hex): {}", unixfsHex.str());
-        
-        logger_->debug("Number of links: {}", merkledagLinks.size());
-        for (size_t i = 0; i < merkledagLinks.size(); ++i) {
-            const auto& link = merkledagLinks[i];
-            std::ostringstream cidHex;
-            for (size_t j = 0; j < link.cid.size(); ++j) {
-                cidHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)link.cid[j] << " ";
-            }
-            logger_->debug("Link[{}]: name='{}' tsize={} CID_bytes(hex)={}", 
-                         i, link.name, link.tsize, cidHex.str());
-        }
-        
         // Use Kubo-compatible MerkleDAG encoder
         std::vector<uint8_t> encodedNode = MerkledagEncoder::encode(unixfsData, merkledagLinks);
-        
-        // Log encoded node hex
-        std::ostringstream encodedHex;
-        for (size_t i = 0; i < std::min(encodedNode.size(), static_cast<size_t>(100)); ++i) {
-            encodedHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)encodedNode[i] << " ";
-        }
-        logger_->debug("Encoded IPLD node first 100 bytes (hex): {}", encodedHex.str());
-        logger_->debug("=== END ENCODING DEBUG ===");
-        
-        // ===== ROUND-TRIP TEST FOR ENCODING/DECODING CONSISTENCY =====
-        {
-            // Test if our encoding can be properly decoded back using both string and vector methods
-            std::string encodedAsString(encodedNode.begin(), encodedNode.end());
-            
-            MerkledagDecoder testDecoder1, testDecoder2;
-            bool vectorDecodeSuccess = testDecoder1.decode(encodedNode);  // Direct vector
-            bool stringDecodeSuccess = testDecoder2.decode(encodedAsString);  // String conversion
-            
-            logger_->debug("=== CHUNKED FILE ENCODING/DECODING ROUND-TRIP TEST ===");
-            logger_->debug("Our encoded node size: {} bytes", encodedNode.size());
-            logger_->debug("Vector decode success: {}", vectorDecodeSuccess);
-            logger_->debug("String decode success: {}", stringDecodeSuccess);
-            
-            if (vectorDecodeSuccess && stringDecodeSuccess) {
-                auto data1 = testDecoder1.getData();
-                auto data2 = testDecoder2.getData();
-                auto links1 = testDecoder1.getLinks();
-                auto links2 = testDecoder2.getLinks();
-                
-                bool dataMatch = (data1.has_value() == data2.has_value()) && 
-                               (!data1.has_value() || *data1 == *data2);
-                bool linksMatch = (links1.size() == links2.size());
-                
-                logger_->debug("Data field matches: {}", dataMatch);
-                logger_->debug("Links count matches: {} ({} vs {})", linksMatch, links1.size(), links2.size());
-                logger_->debug("Round-trip consistency: {}", (dataMatch && linksMatch ? "GOOD" : "BAD"));
-            } else {
-                logger_->debug("Round-trip consistency: FAILED - decode errors");
-            }
-            logger_->debug("=== END CHUNKED FILE ROUND-TRIP TEST ===");
-        }
         
         // Calculate CID for the encoded node
         auto cidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(encodedNode.data(), encodedNode.size());
@@ -1938,9 +1510,6 @@ namespace sgns::ipfs_bitswap {
                     auto it = blockStore_.find(cid);
                     if (it != blockStore_.end()) {
                         link.tsize = it->second.size; // Total serialized IPLD size including UnixFS wrapper
-                        logger_->debug("Setting tsize for chunk link to CID {}: {} bytes", 
-                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value(), 
-                                     link.tsize);
                     } else {
                         link.tsize = 0; // Fallback if not found in block store
                         logger_->warn("Could not find block size for CID {} in block store", 
@@ -2032,9 +1601,7 @@ namespace sgns::ipfs_bitswap {
         // Set filesize field to match Kubo's UnixFS structure exactly
         unixfsData.set_filesize(rawData.size());
         
-        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
-        //size_t serializedSize = unixfsData.ByteSizeLong();
-        //std::vector<uint8_t> unixfsBytes(serializedSize);
+        // Serialize UnixFS data using SerializeToString
         std::string unixfsString;
         if (!unixfsData.SerializeToString(&unixfsString)) {
             logger_->error("Failed to serialize UnixFS data for raw chunk");
@@ -2044,24 +1611,8 @@ namespace sgns::ipfs_bitswap {
         // No links for individual chunks
         std::map<std::string, std::vector<uint8_t>> links;
         
-        // Log UnixFS data before IPLD encoding
-        logger_->debug("UnixFS data size: {} bytes", unixfsString.size());
-        //logger_->debug("UnixFS hex: {}", bytesToHex(unixfsBytes));
-        
         // Use Kubo-compatible MerkleDAG encoder (matches official go-merkledag protobuf)
         std::vector<uint8_t> encodedNode = MerkledagEncoder::encode(unixfsString, links);
-        
-        // Log IPLD encoded size and first/last bytes to understand the wrapper
-        logger_->debug("IPLD encoded size: {} bytes", encodedNode.size());
-        if (encodedNode.size() > 20) {
-            std::vector<uint8_t> firstBytes(encodedNode.begin(), encodedNode.begin() + 10);
-            std::vector<uint8_t> lastBytes(encodedNode.end() - 10, encodedNode.end());
-            logger_->debug("IPLD first 10 bytes: {}", bytesToHex(firstBytes));
-            logger_->debug("IPLD last 10 bytes: {}", bytesToHex(lastBytes));
-        }
-        
-        // Detailed structure analysis
-        analyzeIPLDStructure(encodedNode, "Our IPLD encoding");
         
         // Calculate CID for the encoded IPLD node
         auto cidResult = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(
@@ -2109,12 +1660,6 @@ namespace sgns::ipfs_bitswap {
         };
         
         blockStore_.emplace(cid, std::move(block));
-        
-        logger_->debug("BLOCK STORED: CID {} -> {} bytes IPLD, {} bytes content (path: {})", 
-                      cidToString(cid), 
-                      blockData.size(),
-                      contentSize,
-                      originalPath.empty() ? "none" : originalPath);
     }
 
     void Bitswap::handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream)
@@ -2123,12 +1668,8 @@ namespace sgns::ipfs_bitswap {
         
         auto blockIt = blockStore_.find(wantedCid);
         if (blockIt != blockStore_.end()) {
-            logger_->debug("Responding to wantlist request for CID: {}", cidToString(wantedCid));
-            
             // Send the block back to the requesting peer
             sendBlockResponse(wantedCid, blockIt->second.data, stream);
-        } else {
-            logger_->trace("Block not found for wantlist request: {}", cidToString(wantedCid));
         }
     }
 
@@ -2138,25 +1679,14 @@ namespace sgns::ipfs_bitswap {
         bitswap_pb::Message pb_msg;
         BitswapMessage msg(pb_msg);
         
-        logger_->debug("Preparing to send block response for CID: {} ({} bytes block data)", cidToString(cid), blockData.size());
-        logger_->debug("Stream state before response: closed={}, closedForRead={}, closedForWrite={}", 
-                      stream->isClosed(), stream->isClosedForRead(), stream->isClosedForWrite());
-        
         // Add the block to the message - the blockData should be the raw content without CID prefix
         pb_msg.add_blocks(blockData);
-        
-        logger_->debug("Added block to protobuf message, total blocks in message: {}", pb_msg.blocks_size());
         
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>(stream);
         rw->write<bitswap_pb::Message>(
             pb_msg,
-            [ctx = shared_from_this(), cid, blockSize = blockData.size(), stream](auto&& writtenBytes) {
-                if (writtenBytes) {
-                    ctx->logger_->debug("Successfully sent block response for CID: {} ({} bytes written, {} block size)",
-                                       cidToString(cid), writtenBytes.value(), blockSize);
-                    ctx->logger_->debug("Stream state after response: closed={}, closedForRead={}, closedForWrite={}", 
-                                       stream->isClosed(), stream->isClosedForRead(), stream->isClosedForWrite());
-                } else {
+            [ctx = shared_from_this(), cid, stream](auto&& writtenBytes) {
+                if (!writtenBytes) {
                     ctx->logger_->error("Failed to send block response for CID: {}, error: {}",
                                        cidToString(cid), writtenBytes.error().message());
                 }
