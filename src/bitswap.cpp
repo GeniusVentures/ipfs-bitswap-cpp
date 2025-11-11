@@ -2,6 +2,8 @@
 
 #include "bitswap_message.hpp"
 #include <proto/unixfs.pb.h>
+#include <proto/merkledag.pb.h>
+#include "merkledag_encoder.hpp"
 
 #include <string>
 #include <tuple>
@@ -11,13 +13,13 @@
 #include <algorithm>
 #include <random>
 #include <functional>
+#include <sstream>
+#include <iomanip>
 
 #include <libp2p/basic/protobuf_message_read_writer.hpp>
 #include <libp2p/multi/content_identifier_codec.hpp>
-#include <ipfs_lite/ipld/impl/ipld_node_decoder_pb.hpp>
-#include <ipfs_lite/ipld/impl/ipld_node_encoder_pb.hpp>
+#include "merkledag_decoder.hpp"
 #include <boost/asio/deadline_timer.hpp>
-#include <common/buffer.hpp>
 
 #include <boost/assert.hpp>
 
@@ -55,6 +57,20 @@ namespace
     std::string cidToString(const libp2p::multi::ContentIdentifier& cid) {
         auto result = libp2p::multi::ContentIdentifierCodec::toString(cid);
         return result.has_value() ? result.value() : "invalid";
+    }
+
+    // Helper function to calculate varint encoded length
+    uint64_t getVarintEncodedLength(uint64_t value) {
+        if (value < 0x80) return 1;
+        if (value < 0x4000) return 2;
+        if (value < 0x200000) return 3;
+        if (value < 0x10000000) return 4;
+        if (value < 0x800000000ULL) return 5;
+        if (value < 0x40000000000ULL) return 6;
+        if (value < 0x2000000000000ULL) return 7;
+        if (value < 0x100000000000000ULL) return 8;
+        if (value < 0x8000000000000000ULL) return 9;
+        return 10;
     }
 }  // namespace
 
@@ -107,6 +123,9 @@ namespace sgns::ipfs_bitswap {
 
     void Bitswap::initialize()
     {
+        // Set logger to debug level for detailed UnixFS analysis
+        logger_->set_level(spdlog::level::debug);
+        
         // Register this bitswap instance as the protocol handler for bitswap protocol
         host_.getRouter().setProtocolHandler(getProtocolId(), 
             [weak_self = std::weak_ptr<Bitswap>(shared_from_this())](auto stream_result) {
@@ -701,6 +720,7 @@ namespace sgns::ipfs_bitswap {
             return; // Don't process if already timed out
         }
 
+        logger_->set_level(spdlog::level::trace);
         logger_->debug("Processing UnixFS block for CID: {}", libp2p::multi::ContentIdentifierCodec::toString(cid).value());
 
         // Check if we've already processed this CID to prevent duplicates
@@ -727,9 +747,8 @@ namespace sgns::ipfs_bitswap {
         }
 
         // First, decode the IPLD structure
-        auto decoder = ipfs_lite::ipld::IPLDNodeDecoderPB();
-        auto byteSpan = gsl::span<const uint8_t>(reinterpret_cast<const uint8_t*>(blockData.data()), blockData.size());
-        auto diddecode = decoder.decode(byteSpan);
+        MerkledagDecoder decoder;
+        bool diddecode = decoder.decode(blockData);
         
         if (!diddecode) {
             if (!ctx->timedOut) {
@@ -740,27 +759,60 @@ namespace sgns::ipfs_bitswap {
             return;
         }
 
-        // Process any links (additional CIDs to fetch)
-        for (size_t i = 0; i < decoder.getLinksCount(); ++i) {
-            auto linkCidData = decoder.getLinkCID(i);
-            auto subcid = libp2p::multi::ContentIdentifierCodec::decode(
-                gsl::span((uint8_t*)linkCidData.data(), linkCidData.size()));
+        // ===== CID CALCULATION COMPARISON WITH KUBO =====
+        // Test if our CID calculation method matches Kubo's by applying it to Kubo's raw IPLD data
+        {
+            std::vector<uint8_t> kuboBlockData(blockData.begin(), blockData.end());
+            auto kuboCidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(kuboBlockData.data(), kuboBlockData.size());
             
-            if (subcid && ctx->completedCIDs.find(subcid.value()) == ctx->completedCIDs.end()) {
+            if (!kuboCidBytes.empty()) {
+                auto kuboCidDecoded = libp2p::multi::ContentIdentifierCodec::decode(
+                    gsl::span(reinterpret_cast<const uint8_t*>(kuboCidBytes.data()), kuboCidBytes.size())
+                );
+                if (kuboCidDecoded) {
+                    auto kuboCidString = libp2p::multi::ContentIdentifierCodec::toString(kuboCidDecoded.value());
+                    auto expectedCidString = libp2p::multi::ContentIdentifierCodec::toString(cid);
+                    
+                    logger_->debug("=== CID CALCULATION TEST ===");
+                    logger_->debug("Expected CID: {}", expectedCidString.value());
+                    logger_->debug("Kubo IPLD data -> our CID calc: {}", kuboCidString.value());
+                    logger_->debug("CIDs match: {}", (kuboCidDecoded.value() == cid ? "YES" : "NO"));
+                    logger_->debug("Kubo IPLD data size: {} bytes", kuboBlockData.size());
+                    
+                    // Log raw Kubo IPLD node bytes for direct comparison
+                    std::ostringstream kuboHex;
+                    for (size_t i = 0; i < std::min(kuboBlockData.size(), static_cast<size_t>(100)); ++i) {
+                        kuboHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)kuboBlockData[i] << " ";
+                    }
+                    logger_->debug("Kubo IPLD node first 100 bytes (hex): {}", kuboHex.str());
+                    logger_->debug("=== END CID TEST ===");
+                } else {
+                    logger_->debug("Failed to decode CID calculated from Kubo IPLD data");
+                }
+            } else {
+                logger_->debug("Failed to calculate CID from Kubo IPLD data");
+            }
+        }
+
+        // Process any links (additional CIDs to fetch)
+        auto links = decoder.getLinks();
+        for (const auto& link : links) {
+            if (ctx->completedCIDs.find(link.cid) == ctx->completedCIDs.end()) {
                 // We haven't processed this CID yet
-                ctx->pendingCIDs.insert(subcid.value());
+                ctx->pendingCIDs.insert(link.cid);
                 
-                logger_->debug("Found linked CID: {}, queuing...", libp2p::multi::ContentIdentifierCodec::toString(subcid.value()).value());
+                logger_->debug("Found linked CID: {}, queuing...", libp2p::multi::ContentIdentifierCodec::toString(link.cid).value());
                 
                 // Add to queue instead of making immediate request
-                ctx->requestQueue.push(subcid.value());
+                ctx->requestQueue.push(link.cid);
                 processRequestQueue(ctx);
             }
         }
 
         // Parse UnixFS data from the IPLD content
         unixfs_pb::Data unixfsData;
-        if (!unixfsData.ParseFromString(decoder.getContent())) {
+        auto dataOpt = decoder.getData();
+        if (!dataOpt || !unixfsData.ParseFromArray(dataOpt->data(), static_cast<int>(dataOpt->size()))) {
             if (!ctx->timedOut) {
                 ctx->callback(BitswapError::INVALID_UNIXFS_DATA);
                 std::lock_guard<std::mutex> guard(mutexContentRequests_);
@@ -768,6 +820,61 @@ namespace sgns::ipfs_bitswap {
             }
             return;
         }
+        logger_->set_level(spdlog::level::debug);
+        // ===== DETAILED LOGGING FOR KUBO UNIXFS STRUCTURE ANALYSIS =====
+        auto cidString = libp2p::multi::ContentIdentifierCodec::toString(cid);
+        logger_->debug("==== KUBO UnixFS Analysis for CID: {} ====", cidString ? cidString.value() : "invalid");
+        logger_->debug("UnixFS Type: {}", static_cast<int>(unixfsData.type()));
+        logger_->debug("Has data field: {}", unixfsData.has_data());
+        if (unixfsData.has_data()) {
+            logger_->debug("Data field size: {} bytes", unixfsData.data().size());
+        }
+        logger_->debug("Has filesize field: {}", unixfsData.has_filesize());
+        if (unixfsData.has_filesize()) {
+            logger_->debug("Filesize: {} bytes", unixfsData.filesize());
+        }
+        logger_->debug("Has mode field: {}", unixfsData.has_mode());
+        if (unixfsData.has_mode()) {
+            logger_->debug("mode: {} ", unixfsData.mode());
+        }
+        logger_->debug("Has time field: {}", unixfsData.has_mtime());
+        logger_->debug("Has fanout field: {}", unixfsData.has_fanout());
+        logger_->debug("Has type field: {}", unixfsData.has_type());
+        // if (unixfsData.has_mtime()) {
+        //     logger_->debug("mtime: {} ", unixfsData.mtime());
+        // }
+        logger_->debug("Blocksizes count: {}", unixfsData.blocksizes_size());
+        for (int i = 0; i < unixfsData.blocksizes_size(); ++i) {
+            logger_->debug("  Blocksize[{}]: {} bytes", i, unixfsData.blocksizes(i));
+        }
+        logger_->debug("IPLD Links count: {}", links.size());
+        for (size_t i = 0; i < links.size(); ++i) {
+            const auto& link = links[i];
+            auto subcidString = libp2p::multi::ContentIdentifierCodec::toString(link.cid);
+            std::string cidStr = subcidString ? subcidString.value() : "invalid";
+            logger_->debug("  Link[{}]: name='{}' -> CID='{}' size='{}'", i, link.name, cidStr, link.size);
+            
+            // Log raw link CID bytes for comparison
+            auto cidBytes = libp2p::multi::ContentIdentifierCodec::encode(link.cid);
+            if (cidBytes.has_value()) {
+                std::ostringstream linkHex;
+                for (size_t j = 0; j < cidBytes.value().size(); ++j) {
+                    linkHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)cidBytes.value()[j] << " ";
+                }
+                logger_->debug("    Kubo Link[{}] CID bytes (hex): {}", i, linkHex.str());
+            }
+        }
+        
+        // Log raw UnixFS protobuf data for comparison
+        size_t serializedSize = unixfsData.ByteSizeLong();
+        std::vector<uint8_t> serializedUnixFS(serializedSize);
+        unixfsData.SerializeToArray(serializedUnixFS.data(), static_cast<int>(serializedSize));
+        std::ostringstream hexStream;
+        for (unsigned char c : serializedUnixFS) {
+            hexStream << std::hex << std::setfill('0') << std::setw(2) << (unsigned)c << " ";
+        }
+        logger_->debug("Raw UnixFS protobuf (hex): {}", hexStream.str());
+        logger_->debug("==== End Kubo UnixFS Analysis ====");
 
         // Handle different UnixFS data types
         switch (unixfsData.type()) {
@@ -790,8 +897,10 @@ namespace sgns::ipfs_bitswap {
         checkContentRequestComplete(ctx);
     }
 
-    void Bitswap::handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& path)
+    void Bitswap::handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const MerkledagDecoder& decoder, const std::string& path)
     {
+        auto links = decoder.getLinks();
+        
         // Use the path parameter, but if it's empty, try to look up from cidToPath
         std::string filePath = path;
         if (filePath.empty()) {
@@ -803,7 +912,7 @@ namespace sgns::ipfs_bitswap {
         }
         
         // If there are no links, this is a complete file block or single chunk
-        if (decoder.getLinksCount() == 0) {
+        if (links.size() == 0) {
             if (unixfsData.has_data()) {
                 UnixFSFile file;
                 file.path = filePath;
@@ -822,7 +931,8 @@ namespace sgns::ipfs_bitswap {
             }
         } else {
             // This file has multiple chunks - set up for chunk assembly
-            logger_->debug("Multi-chunk file detected: {} with {} chunks", filePath, decoder.getLinksCount());
+            auto links = decoder.getLinks();
+            logger_->debug("Multi-chunk file detected: {} with {} chunks", filePath, links.size());
             
             // Check if we already have this file in progress to prevent duplicates
             if (ctx->filesInProgress.find(cid) != ctx->filesInProgress.end()) {
@@ -832,7 +942,7 @@ namespace sgns::ipfs_bitswap {
             
             ContentRequestContext::FileInProgress& fileProgress = ctx->filesInProgress[cid];
             fileProgress.path = filePath;
-            fileProgress.expectedChunks = decoder.getLinksCount();
+            fileProgress.expectedChunks = links.size();
             fileProgress.totalSize = unixfsData.has_filesize() ? unixfsData.filesize() : 0;
             
             if (unixfsData.has_mode()) {
@@ -854,24 +964,21 @@ namespace sgns::ipfs_bitswap {
             }
             
             // Request all linked chunks
-            for (size_t i = 0; i < decoder.getLinksCount(); ++i) {
-                auto linkCidData = decoder.getLinkCID(i);
-                auto linkCid = libp2p::multi::ContentIdentifierCodec::decode(
-                    gsl::span((uint8_t*)linkCidData.data(), linkCidData.size()));
+            for (size_t i = 0; i < links.size(); ++i) {
+                const auto& link = links[i];
                 
-                if (linkCid && ctx->completedCIDs.find(linkCid.value()) == ctx->completedCIDs.end()) {
-                    ctx->pendingCIDs.insert(linkCid.value());
-                    ctx->cidToPath[linkCid.value()] = filePath; // Track which file this chunk belongs to
-                    ctx->chunkToCidIndex[linkCid.value()] = ContentRequestContext::ChunkInfo(cid, i); // Track this is chunk i of file cid
+                if (ctx->completedCIDs.find(link.cid) == ctx->completedCIDs.end()) {
+                    ctx->pendingCIDs.insert(link.cid);
+                    ctx->cidToPath[link.cid] = filePath; // Track which file this chunk belongs to
+                    ctx->chunkToCidIndex[link.cid] = ContentRequestContext::ChunkInfo(cid, i); // Track this is chunk i of file cid
                     
                     logger_->debug("Requesting file chunk {} for {}", i + 1, filePath);
                     
-                    auto cidValue = linkCid.value(); // Extract the CID value
                     // Add to queue instead of making immediate request
-                    ctx->requestQueue.push(cidValue);
+                    ctx->requestQueue.push(link.cid);
                     processRequestQueue(ctx);
-                } // Close if linkCid check
-            } // Close for loop
+                }
+            }
         }
     }
 
@@ -901,9 +1008,8 @@ namespace sgns::ipfs_bitswap {
         auto& fileProgress = ctx->filesInProgress[parentCid];
         
         // Decode the chunk data to extract the actual content
-        auto decoder = ipfs_lite::ipld::IPLDNodeDecoderPB();
-        auto byteSpan = gsl::span((uint8_t*)chunkData.data(), chunkData.size());
-        auto didDecode = decoder.decode(byteSpan);
+        MerkledagDecoder decoder;
+        auto didDecode = decoder.decode(chunkData);
         
         if (!didDecode) {
             logger_->error("Failed to decode IPLD chunk for file: {}", fileProgress.path);
@@ -915,14 +1021,30 @@ namespace sgns::ipfs_bitswap {
         
         // Try to parse as UnixFS data first
         unixfs_pb::Data unixfsData;
-        if (unixfsData.ParseFromString(decoder.getContent()) && unixfsData.has_data()) {
+        auto dataOpt = decoder.getData();
+        if (dataOpt && unixfsData.ParseFromArray(dataOpt->data(), static_cast<int>(dataOpt->size())) && unixfsData.has_data()) {
             // This chunk contains UnixFS wrapped data
             chunkContent = std::vector<char>(unixfsData.data().begin(), unixfsData.data().end());
             logger_->debug("Decoded UnixFS chunk {} for {} ({} bytes)", chunkIndex, fileProgress.path, chunkContent.size());
+            
+            // For first chunk, log some raw data comparison
+            if (chunkIndex == 0) {
+                std::stringstream hex_stream;
+                for (size_t i = 0; i < std::min(chunkContent.size(), static_cast<size_t>(32)); ++i) {
+                    hex_stream << std::hex << std::setfill('0') << std::setw(2) 
+                              << static_cast<unsigned>(static_cast<unsigned char>(chunkContent[i])) << " ";
+                }
+                logger_->debug("Kubo chunk 0 first 32 bytes (hex): {}", hex_stream.str());
+            }
+            logger_->debug("Chunk {} UnixFS filesize field present: {}", chunkIndex, unixfsData.has_filesize());
+            logger_->debug("Chunk {} UnixFS mode field present: {}", chunkIndex, unixfsData.has_mode());
+            logger_->debug("Chunk {} UnixFS mtime field present: {}", chunkIndex, unixfsData.has_mtime());
+            logger_->debug("Chunk {} UnixFS type field present: {}", chunkIndex, unixfsData.has_type());
         } else {
             // This might be raw data
-            const auto& rawContent = decoder.getContent();
-            chunkContent = std::vector<char>(rawContent.begin(), rawContent.end());
+            if (dataOpt) {
+                chunkContent = std::vector<char>(dataOpt->begin(), dataOpt->end());
+            }
             logger_->debug("Decoded raw chunk {} for {} ({} bytes)", chunkIndex, fileProgress.path, chunkContent.size());
         }
         
@@ -1004,60 +1126,47 @@ namespace sgns::ipfs_bitswap {
         }
     }
 
-    void Bitswap::handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& basePath)
+    void Bitswap::handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const MerkledagDecoder& decoder, const std::string& basePath)
     {
-        logger_->debug("Processing directory block with {} entries, basePath: '{}'", decoder.getLinksCount(), basePath);
+        auto links = decoder.getLinks();
+        logger_->debug("Processing directory block with {} entries, basePath: '{}'", links.size(), basePath);
         
         // Directory blocks contain links to their contents
-        for (size_t i = 0; i < decoder.getLinksCount(); ++i) {
-            auto linkName = decoder.getLinkName(i);
-            auto linkCidData = decoder.getLinkCID(i);
-            auto linkSize = decoder.getLinkSize(i);
-            
-            if (linkName.empty()) {
-                logger_->warn("Directory entry {} has empty name, skipping", i);
+        for (const auto& link : links) {
+            if (link.name.empty()) {
+                logger_->warn("Directory entry has empty name, skipping");
                 continue;
             }
             
             // Construct the full path for this entry
-            std::string childPath = basePath.empty() ? linkName : basePath + "/" + linkName;
-            
-            // Parse the linked CID
-            auto linkCid = libp2p::multi::ContentIdentifierCodec::decode(
-                gsl::span((uint8_t*)linkCidData.data(), linkCidData.size()));
-            
-            if (!linkCid) {
-                logger_->error("Failed to parse CID for directory entry: {}", childPath);
-                continue;
-            }
+            std::string childPath = basePath.empty() ? link.name : basePath + "/" + link.name;
             
             // Check if we've already processed this CID
-            if (ctx->completedCIDs.find(linkCid.value()) != ctx->completedCIDs.end()) {
+            if (ctx->completedCIDs.find(link.cid) != ctx->completedCIDs.end()) {
                 logger_->debug("Already processed CID for {}, skipping", childPath);
                 continue;
             }
             
             // Always ensure the path mapping is set up, even for duplicates
-            ctx->cidToPath[linkCid.value()] = childPath;
+            ctx->cidToPath[link.cid] = childPath;
             
             // Check if we're already processing this CID
-            if (ctx->pendingCIDs.find(linkCid.value()) != ctx->pendingCIDs.end()) {
+            if (ctx->pendingCIDs.find(link.cid) != ctx->pendingCIDs.end()) {
                 logger_->debug("Already pending CID for {}, skipping duplicate", childPath);
                 continue;
             }
             
             // Add to pending
-            ctx->pendingCIDs.insert(linkCid.value());
+            ctx->pendingCIDs.insert(link.cid);
             
             logger_->debug("Requesting directory entry: {} -> {}", childPath, 
-                          libp2p::multi::ContentIdentifierCodec::toString(linkCid.value()).value());
+                          libp2p::multi::ContentIdentifierCodec::toString(link.cid).value());
             
             // Add to request queue instead of making direct request
-            auto cidValue = linkCid.value();
-            ctx->requestQueue.push(cidValue);
+            ctx->requestQueue.push(link.cid);
         }
         
-        logger_->debug("Directory block processed: {} entries queued for processing", decoder.getLinksCount());
+        logger_->debug("Directory block processed: {} entries queued for processing", links.size());
         
         // Process the queued directory entries
         processRequestQueue(ctx);
@@ -1299,52 +1408,120 @@ namespace sgns::ipfs_bitswap {
         }
     }
 
+    std::string Bitswap::bytesToHex(const std::vector<uint8_t>& bytes)
+    {
+        std::ostringstream hexStream;
+        for (uint8_t byte : bytes) {
+            hexStream << std::hex << std::setfill('0') << std::setw(2) << static_cast<unsigned>(byte) << " ";
+        }
+        return hexStream.str();
+    }
+
+    void Bitswap::analyzeIPLDStructure(const std::vector<uint8_t>& data, const std::string& label)
+    {
+        logger_->debug("=== IPLD Structure Analysis: {} ===", label);
+        logger_->debug("Total size: {} bytes", data.size());
+        
+        // Analyze protobuf structure
+        if (data.size() > 10) {
+            for (size_t i = 0; i < std::min(size_t(20), data.size()); ++i) {
+                uint8_t byte = data[i];
+                uint8_t tag = (byte >> 3) & 0x1F;
+                uint8_t wireType = byte & 0x07;
+                
+                if (wireType <= 5) { // Valid wire types
+                    logger_->debug("Byte {}: 0x{:02X} (tag={}, wire_type={})", i, byte, tag, wireType);
+                }
+            }
+        }
+        logger_->debug("=== End Analysis ===");
+    }
+
     CID Bitswap::encodeChunkedFile(const std::vector<uint8_t>& content, const std::string& filePath)
     {
         const size_t CHUNK_SIZE = 256 * 1024; // 256KB chunks
         std::vector<CID> chunkCIDs;
-        std::vector<uint64_t> chunkSizes;
+        std::vector<uint64_t> chunkSizes; // This will store the actual IPLD block sizes (including UnixFS wrapper)
         
-        // Create chunks
+        // Create chunks - chunks are stored as Raw blocks with UnixFS wrapper
         for (size_t offset = 0; offset < content.size(); offset += CHUNK_SIZE) {
-            size_t chunkSize = std::min(CHUNK_SIZE, content.size() - offset);
-            std::vector<uint8_t> chunk(content.begin() + offset, content.begin() + offset + chunkSize);
+            size_t rawChunkSize = std::min(CHUNK_SIZE, content.size() - offset);
+            std::vector<uint8_t> chunk(content.begin() + offset, content.begin() + offset + rawChunkSize);
             
-            CID chunkCID = encodeAndStoreData(chunk, unixfs_pb::Data::Raw);
+            // For first chunk, log some raw data comparison
+            if (offset == 0) {
+                std::stringstream hex_stream;
+                for (size_t i = 0; i < std::min(chunk.size(), static_cast<size_t>(32)); ++i) {
+                    hex_stream << std::hex << std::setfill('0') << std::setw(2) 
+                              << static_cast<unsigned>(chunk[i]) << " ";
+                }
+                logger_->debug("Our chunk 0 first 32 bytes (hex): {}", hex_stream.str());
+            }
+            
+            // Store chunk with UnixFS wrapper (File type to match Kubo)
+            CID chunkCID = createIPLDNodeAndStoreRawData(chunk);
             if (chunkCID.content_address.toBuffer().empty()) {
                 logger_->error("Failed to encode chunk for file: {}", filePath);
                 throw std::runtime_error("Failed to encode chunk for file: " + filePath);
             }
             
+            // Use raw chunk size for blocksizes field (as confirmed by Kubo analysis)
+            chunkSizes.push_back(chunk.size());
             chunkCIDs.push_back(chunkCID);
-            chunkSizes.push_back(chunkSize);
         }
 
         // Create root UnixFS node that links to all chunks
         unixfs_pb::Data unixfsData;
         unixfsData.set_type(unixfs_pb::Data::File);
         unixfsData.set_filesize(content.size());
-        
-        // Add blocksizes for each chunk
+        // Add blocksizes for each chunk in order
         for (uint64_t size : chunkSizes) {
             unixfsData.add_blocksizes(size);
         }
+        
+        // Do NOT set data field for chunked files (only blocksizes and links)
 
-        // Serialize UnixFS data
+        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
+        // size_t serializedSize = unixfsData.ByteSizeLong();
+        // std::vector<uint8_t> serializedUnixFS(serializedSize);
         std::string serializedUnixFS;
         if (!unixfsData.SerializeToString(&serializedUnixFS)) {
             logger_->error("Failed to serialize UnixFS data for chunked file: {}", filePath);
             throw std::runtime_error("Failed to serialize UnixFS data for chunked file: " + filePath);
         }
 
-        // Create IPLD links to chunks
-        std::map<std::string, CID> links;
-        for (size_t i = 0; i < chunkCIDs.size(); ++i) {
-            links.emplace(std::to_string(i), chunkCIDs[i]);
+        // ===== DETAILED LOGGING FOR CHUNKED FILE ROOT =====
+        logger_->debug("==== Our Chunked File Root UnixFS ====");
+        logger_->debug("File: {}", filePath);
+        logger_->debug("Total file size: {} bytes", content.size());
+        logger_->debug("Number of chunks: {}", chunkCIDs.size());
+        logger_->debug("UnixFS Type: {}", static_cast<int>(unixfsData.type()));
+        logger_->debug("Has data field: {} (should be false for chunked files)", unixfsData.has_data());
+        logger_->debug("Has filesize field: {}", unixfsData.has_filesize());
+        if (unixfsData.has_filesize()) {
+            logger_->debug("Filesize: {} bytes", unixfsData.filesize());
         }
+        logger_->debug("Blocksizes count: {}", unixfsData.blocksizes_size());
+        for (int i = 0; i < unixfsData.blocksizes_size(); ++i) {
+            logger_->debug("  Blocksize[{}]: {} bytes", i, unixfsData.blocksizes(i));
+        }
+        
+        // Log chunk CIDs
+        for (size_t i = 0; i < chunkCIDs.size(); ++i) {
+            auto chunkCidString = libp2p::multi::ContentIdentifierCodec::toString(chunkCIDs[i]);
+            logger_->debug("  Chunk[{}] CID: {}", i, chunkCidString ? chunkCidString.value() : "invalid");
+        }
+        
+        // Log raw UnixFS protobuf data for root node
+        std::ostringstream hexStream;
+        for (unsigned char c : serializedUnixFS) {
+            hexStream << std::hex << std::setfill('0') << std::setw(2) << (unsigned)c << " ";
+        }
+        logger_->debug("Chunked file root UnixFS protobuf (hex): {}", hexStream.str());
+        logger_->debug("==== End Chunked File Root UnixFS ====");
 
-        // Create root IPLD node
-        CID rootCID = createIPLDNode(std::vector<uint8_t>(serializedUnixFS.begin(), serializedUnixFS.end()), links);
+        // Create root IPLD node with ordered chunk CIDs (preserves order and allows duplicate empty names)
+        CID rootCID = createIPLDNode(serializedUnixFS, chunkCIDs);
         
         logger_->debug("Created chunked file with {} chunks, root CID: {}", 
                       chunkCIDs.size(), 
@@ -1396,7 +1573,9 @@ namespace sgns::ipfs_bitswap {
             }
         }
 
-        // Serialize UnixFS data
+        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
+        // size_t serializedSize = unixfsData.ByteSizeLong();
+        // std::vector<uint8_t> serializedUnixFS(serializedSize);
         std::string serializedUnixFS;
         if (!unixfsData.SerializeToString(&serializedUnixFS)) {
             logger_->error("Failed to serialize UnixFS data for directory: {}", directoryPath);
@@ -1404,7 +1583,7 @@ namespace sgns::ipfs_bitswap {
         }
 
         // Create IPLD node
-        CID dirCID = createIPLDNode(std::vector<uint8_t>(serializedUnixFS.begin(), serializedUnixFS.end()), links);
+        CID dirCID = createIPLDNode(serializedUnixFS, links);
         
         logger_->debug("Created directory with {} entries, CID: {}", 
                       links.size(), cidToString(dirCID));
@@ -1415,7 +1594,7 @@ namespace sgns::ipfs_bitswap {
     CID Bitswap::encodeAndStoreData(const std::vector<uint8_t>& data, unixfs_pb::Data::DataType type)
     {
         // Create UnixFS data
-        std::vector<uint8_t> unixfsData = createUnixFSData(data, type, data.size());
+        std::string unixfsData = createUnixFSData(data, type, data.size());
         
         // Create IPLD node to calculate the CID, but store the UnixFS data for bitswap
         CID cid = createIPLDNodeAndStoreUnixFS(unixfsData);
@@ -1427,7 +1606,7 @@ namespace sgns::ipfs_bitswap {
         return cid;
     }
 
-    std::vector<uint8_t> Bitswap::createUnixFSData(const std::vector<uint8_t>& content, 
+    std::string Bitswap::createUnixFSData(const std::vector<uint8_t>& content, 
                                                    unixfs_pb::Data::DataType type, 
                                                    uint64_t filesize, 
                                                    const std::vector<CID>& links)
@@ -1449,46 +1628,86 @@ namespace sgns::ipfs_bitswap {
             // For now, we'll handle this in the chunked file method
         }
 
+        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
+        //size_t serializedSize = unixfsData.ByteSizeLong();
         std::string serialized;
         if (!unixfsData.SerializeToString(&serialized)) {
             logger_->error("Failed to serialize UnixFS data");
             return {};
         }
 
-        return std::vector<uint8_t>(serialized.begin(), serialized.end());
-    }
-
-    CID Bitswap::createIPLDNode(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links)
-    {
-        // Convert to common::Buffer for the encoder
-        common::Buffer content(unixfsData);
-        
-        // Convert links to the format expected by the encoder
-        std::map<std::string, ipfs_lite::ipld::IPLDLinkImpl> ipldLinks;
-        for (const auto& [name, cid] : links) {
-            // Convert to sgns::CID type and determine the size - for now use 0, should be improved
-            sgns::CID sgnsCid(cid);
-            ipldLinks[name] = ipfs_lite::ipld::IPLDLinkImpl(sgnsCid, name, 0);
+        // ===== DETAILED LOGGING FOR OUR UNIXFS CREATION =====
+        logger_->debug("==== Our UnixFS Creation ====");
+        logger_->debug("Creating UnixFS Type: {}", static_cast<int>(unixfsData.type()));
+        logger_->debug("Has data field: {}", unixfsData.has_data());
+        if (unixfsData.has_data()) {
+            logger_->debug("Data field size: {} bytes", unixfsData.data().size());
+        }
+        logger_->debug("Has filesize field: {}", unixfsData.has_filesize());
+        if (unixfsData.has_filesize()) {
+            logger_->debug("Filesize: {} bytes", unixfsData.filesize());
+        }
+        logger_->debug("Blocksizes count: {}", unixfsData.blocksizes_size());
+        for (int i = 0; i < unixfsData.blocksizes_size(); ++i) {
+            logger_->debug("  Blocksize[{}]: {} bytes", i, unixfsData.blocksizes(i));
         }
         
-        // Encode IPLD node
-        std::vector<uint8_t> encodedNode = ipfs_lite::ipld::IPLDNodeEncoderPB::encode(
-            content, ipldLinks, std::set<std::string>{}
-        );
+        // Log raw UnixFS protobuf data for comparison
+        std::ostringstream hexStream;
+        for (unsigned char c : serialized) {
+            hexStream << std::hex << std::setfill('0') << std::setw(2) << (unsigned)c << " ";
+        }
+        logger_->debug("Our raw UnixFS protobuf (hex): {}", hexStream.str());
+        logger_->debug("==== End Our UnixFS Creation ====");
+
+        return serialized;
+    }
+
+    CID Bitswap::createIPLDNode(const std::string& unixfsData, const std::map<std::string, CID>& links)
+    {
+        // Convert links to the format expected by the Kubo-compatible encoder (preserving order)
+        std::vector<MerkledagLink> merkledagLinks;
+        for (const auto& [name, cid] : links) {
+            // Get the raw CID bytes
+            auto cidResult = libp2p::multi::ContentIdentifierCodec::encode(cid);
+            if (cidResult.has_value()) {
+                MerkledagLink link;
+                link.name = name;
+                link.cid = std::move(cidResult.value());
+                
+                // Look up the total serialized size from the block store (tsize should be total IPLD node size)
+                {
+                    std::lock_guard<std::mutex> guard(mutexBlockStore_);
+                    auto it = blockStore_.find(cid);
+                    if (it != blockStore_.end()) {
+                        link.tsize = it->second.size; // Total serialized IPLD size including UnixFS wrapper
+                        logger_->debug("Setting tsize for link to CID {}: {} bytes", 
+                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value(), 
+                                     link.tsize);
+                    } else {
+                        link.tsize = 0; // Fallback if not found in block store
+                        logger_->warn("Could not find block size for CID {} in block store", 
+                                    libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+                    }
+                }
+                
+                merkledagLinks.push_back(std::move(link));
+            }
+        }
+        
+        // Use Kubo-compatible MerkleDAG encoder
+        std::vector<uint8_t> encodedNode = MerkledagEncoder::encode(unixfsData, merkledagLinks);
         
         // Calculate CID for the encoded node
-        auto cidResult = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(
-            encodedNode.data(), encodedNode.size()
-        );
+        auto cidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(encodedNode.data(), encodedNode.size());
         
-        if (cidResult.empty()) {
+        if (cidBytes.empty()) {
             logger_->error("Failed to create CID for IPLD node");
             throw std::runtime_error("Failed to create CID for IPLD node");
         }
         
         auto cid = libp2p::multi::ContentIdentifierCodec::decode(
-            gsl::span(reinterpret_cast<const uint8_t*>(cidResult.data()), cidResult.size())
-        );
+            gsl::span(reinterpret_cast<const uint8_t*>(cidBytes.data()), cidBytes.size()));
         
         if (!cid) {
             logger_->error("Failed to decode created CID: {}", cid.error().message());
@@ -1502,34 +1721,220 @@ namespace sgns::ipfs_bitswap {
         return cid.value();
     }
 
-    CID Bitswap::createIPLDNodeAndStoreUnixFS(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links)
+    CID Bitswap::createIPLDNode(const std::string& unixfsData, const std::vector<CID>& orderedChunkCIDs)
     {
-        // Create IPLD-encoded data for transmission (what real IPFS nodes send)
-        // Convert to common::Buffer for the encoder
-        common::Buffer content(unixfsData);
-        
-        // Convert links to the format expected by the encoder
-        std::map<std::string, ipfs_lite::ipld::IPLDLinkImpl> ipldLinks;
-        for (const auto& [name, linkCid] : links) {
-            // Convert to sgns::CID type and determine the size - for now use 0, should be improved
-            sgns::CID sgnsCid(linkCid);
-            ipldLinks[name] = ipfs_lite::ipld::IPLDLinkImpl(sgnsCid, name, 0);
+        // Create MerkledagLinks from ordered chunk CIDs with empty names and correct tsize
+        std::vector<MerkledagLink> merkledagLinks;
+        for (const auto& cid : orderedChunkCIDs) {
+            // Get the raw CID bytes
+            auto cidResult = libp2p::multi::ContentIdentifierCodec::encode(cid);
+            if (cidResult.has_value()) {
+                MerkledagLink link;
+                link.name = ""; // Kubo uses empty strings for chunk link names
+                link.cid = std::move(cidResult.value());
+                
+                // Look up the total serialized size from the block store
+                {
+                    std::lock_guard<std::mutex> guard(mutexBlockStore_);
+                    auto it = blockStore_.find(cid);
+                    if (it != blockStore_.end()) {
+                        link.tsize = it->second.size; // Total serialized IPLD size including UnixFS wrapper
+                        logger_->debug("Setting tsize for link to CID {}: {} bytes", 
+                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value(), 
+                                     link.tsize);
+                    } else {
+                        link.tsize = 0; // Fallback if not found in block store
+                        logger_->warn("Could not find block size for CID {} in block store", 
+                                    libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+                    }
+                }
+                
+                merkledagLinks.push_back(std::move(link));
+            }
         }
         
-        // Encode IPLD node for storage and transmission
-        std::vector<uint8_t> encodedNode = ipfs_lite::ipld::IPLDNodeEncoderPB::encode(
-            content, ipldLinks, std::set<std::string>{}
-        );
+        // ===== DEBUG: LOG UNIXFS DATA AND LINKS BEFORE ENCODING =====
+        logger_->debug("=== DETAILED ENCODING DEBUG ===");
+        logger_->debug("UnixFS data size: {} bytes", unixfsData.size());
+        
+        // Log UnixFS data hex
+        std::ostringstream unixfsHex;
+        for (size_t i = 0; i < unixfsData.size(); ++i) {
+            unixfsHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)unixfsData[i] << " ";
+        }
+        logger_->debug("UnixFS data (hex): {}", unixfsHex.str());
+        
+        logger_->debug("Number of links: {}", merkledagLinks.size());
+        for (size_t i = 0; i < merkledagLinks.size(); ++i) {
+            const auto& link = merkledagLinks[i];
+            std::ostringstream cidHex;
+            for (size_t j = 0; j < link.cid.size(); ++j) {
+                cidHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)link.cid[j] << " ";
+            }
+            logger_->debug("Link[{}]: name='{}' tsize={} CID_bytes(hex)={}", 
+                         i, link.name, link.tsize, cidHex.str());
+        }
+        
+        // Use Kubo-compatible MerkleDAG encoder
+        std::vector<uint8_t> encodedNode = MerkledagEncoder::encode(unixfsData, merkledagLinks);
+        
+        // Log encoded node hex
+        std::ostringstream encodedHex;
+        for (size_t i = 0; i < std::min(encodedNode.size(), static_cast<size_t>(100)); ++i) {
+            encodedHex << std::hex << std::setfill('0') << std::setw(2) << (unsigned)encodedNode[i] << " ";
+        }
+        logger_->debug("Encoded IPLD node first 100 bytes (hex): {}", encodedHex.str());
+        logger_->debug("=== END ENCODING DEBUG ===");
+        
+        // ===== ROUND-TRIP TEST FOR ENCODING/DECODING CONSISTENCY =====
+        {
+            // Test if our encoding can be properly decoded back using both string and vector methods
+            std::string encodedAsString(encodedNode.begin(), encodedNode.end());
+            
+            MerkledagDecoder testDecoder1, testDecoder2;
+            bool vectorDecodeSuccess = testDecoder1.decode(encodedNode);  // Direct vector
+            bool stringDecodeSuccess = testDecoder2.decode(encodedAsString);  // String conversion
+            
+            logger_->debug("=== CHUNKED FILE ENCODING/DECODING ROUND-TRIP TEST ===");
+            logger_->debug("Our encoded node size: {} bytes", encodedNode.size());
+            logger_->debug("Vector decode success: {}", vectorDecodeSuccess);
+            logger_->debug("String decode success: {}", stringDecodeSuccess);
+            
+            if (vectorDecodeSuccess && stringDecodeSuccess) {
+                auto data1 = testDecoder1.getData();
+                auto data2 = testDecoder2.getData();
+                auto links1 = testDecoder1.getLinks();
+                auto links2 = testDecoder2.getLinks();
+                
+                bool dataMatch = (data1.has_value() == data2.has_value()) && 
+                               (!data1.has_value() || *data1 == *data2);
+                bool linksMatch = (links1.size() == links2.size());
+                
+                logger_->debug("Data field matches: {}", dataMatch);
+                logger_->debug("Links count matches: {} ({} vs {})", linksMatch, links1.size(), links2.size());
+                logger_->debug("Round-trip consistency: {}", (dataMatch && linksMatch ? "GOOD" : "BAD"));
+            } else {
+                logger_->debug("Round-trip consistency: FAILED - decode errors");
+            }
+            logger_->debug("=== END CHUNKED FILE ROUND-TRIP TEST ===");
+        }
+        
+        // Calculate CID for the encoded node
+        auto cidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(encodedNode.data(), encodedNode.size());
+        
+        if (cidBytes.empty()) {
+            logger_->error("Failed to create CID for IPLD node");
+            throw std::runtime_error("Failed to create CID for IPLD node");
+        }
+        
+        auto cid = libp2p::multi::ContentIdentifierCodec::decode(
+            gsl::span(reinterpret_cast<const uint8_t*>(cidBytes.data()), cidBytes.size()));
+        
+        if (!cid) {
+            logger_->error("Failed to decode created CID: {}", cid.error().message());
+            throw std::runtime_error("Failed to decode created CID: " + cid.error().message());
+        }
+        
+        // Store the block
+        std::string blockData(encodedNode.begin(), encodedNode.end());
+        storeBlock(cid.value(), blockData);
+        
+        return cid.value();
+    }
+
+    CID Bitswap::createIPLDNodeAndStoreUnixFS(const std::string& unixfsData, const std::map<std::string, CID>& links)
+    {
+        // Convert links to the format expected by the Kubo-compatible encoder (preserving order)
+        std::vector<MerkledagLink> merkledagLinks;
+        for (const auto& [name, cid] : links) {
+            // Get the raw CID bytes
+            auto cidResult = libp2p::multi::ContentIdentifierCodec::encode(cid);
+            if (cidResult.has_value()) {
+                MerkledagLink link;
+                link.name = name;
+                link.cid = std::move(cidResult.value());
+                link.tsize = 0; // Set to 0 as in original code
+                merkledagLinks.push_back(std::move(link));
+            }
+        }
+        
+        // Use MerkledagEncoder for Kubo-compatible encoding
+        std::vector<uint8_t> encodedNode = MerkledagEncoder::encode(unixfsData, merkledagLinks);
         
         // Calculate CID from the IPLD-encoded data (same way real IPFS nodes do)
         // This ensures the server and client calculate the same CID
+        auto cidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(encodedNode.data(), encodedNode.size());
+        
+        if (cidBytes.empty()) {
+            logger_->error("Failed to create CID for IPLD node");
+            throw std::runtime_error("Failed to create CID for IPLD node");
+        }
+        
+        auto cid = libp2p::multi::ContentIdentifierCodec::decode(
+            gsl::span(reinterpret_cast<const uint8_t*>(cidBytes.data()), cidBytes.size()));
+        
+        if (!cid) {
+            logger_->error("Failed to decode created CID: {}", cid.error().message());
+            throw std::runtime_error("Failed to decode created CID: " + cid.error().message());
+        }
+        
+        // Store the IPLD-encoded data (what real IPFS nodes store and send)
+        std::string ipldDataStr(encodedNode.begin(), encodedNode.end());
+        storeBlock(cid.value(), ipldDataStr);
+        
+        return cid.value();
+    }
+
+    CID Bitswap::createIPLDNodeAndStoreRawData(const std::vector<uint8_t>& rawData)
+    {
+        // For individual data chunks, Kubo wraps them in UnixFS with type File (not Raw)
+        // This creates the same wrapper that Kubo uses for chunks
+        
+        unixfs_pb::Data unixfsData;
+        unixfsData.set_type(unixfs_pb::Data::File);
+        unixfsData.set_data(rawData.data(), rawData.size());
+        // Set filesize field to match Kubo's UnixFS structure exactly
+        unixfsData.set_filesize(rawData.size());
+        
+        // Serialize UnixFS data using SerializeToArray for consistency with ParseFromArray
+        //size_t serializedSize = unixfsData.ByteSizeLong();
+        //std::vector<uint8_t> unixfsBytes(serializedSize);
+        std::string unixfsString;
+        if (!unixfsData.SerializeToString(&unixfsString)) {
+            logger_->error("Failed to serialize UnixFS data for raw chunk");
+            throw std::runtime_error("Failed to serialize UnixFS data for raw chunk");
+        }
+        
+        // No links for individual chunks
+        std::map<std::string, std::vector<uint8_t>> links;
+        
+        // Log UnixFS data before IPLD encoding
+        logger_->debug("UnixFS data size: {} bytes", unixfsString.size());
+        //logger_->debug("UnixFS hex: {}", bytesToHex(unixfsBytes));
+        
+        // Use Kubo-compatible MerkleDAG encoder (matches official go-merkledag protobuf)
+        std::vector<uint8_t> encodedNode = MerkledagEncoder::encode(unixfsString, links);
+        
+        // Log IPLD encoded size and first/last bytes to understand the wrapper
+        logger_->debug("IPLD encoded size: {} bytes", encodedNode.size());
+        if (encodedNode.size() > 20) {
+            std::vector<uint8_t> firstBytes(encodedNode.begin(), encodedNode.begin() + 10);
+            std::vector<uint8_t> lastBytes(encodedNode.end() - 10, encodedNode.end());
+            logger_->debug("IPLD first 10 bytes: {}", bytesToHex(firstBytes));
+            logger_->debug("IPLD last 10 bytes: {}", bytesToHex(lastBytes));
+        }
+        
+        // Detailed structure analysis
+        analyzeIPLDStructure(encodedNode, "Our IPLD encoding");
+        
+        // Calculate CID for the encoded IPLD node
         auto cidResult = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(
             encodedNode.data(), encodedNode.size()
         );
         
         if (cidResult.empty()) {
-            logger_->error("Failed to create CID for IPLD node");
-            throw std::runtime_error("Failed to create CID for IPLD node");
+            logger_->error("Failed to create CID for IPLD chunk");
+            throw std::runtime_error("Failed to create CID for IPLD chunk");
         }
         
         auto cid = libp2p::multi::ContentIdentifierCodec::decode(
@@ -1541,9 +1946,9 @@ namespace sgns::ipfs_bitswap {
             throw std::runtime_error("Failed to decode created CID: " + cid.error().message());
         }
         
-        // Store the IPLD-encoded data (what real IPFS nodes store and send)
-        std::string ipldDataStr(encodedNode.begin(), encodedNode.end());
-        storeBlock(cid.value(), ipldDataStr);
+        // Store the IPLD-encoded data (matches Kubo's format exactly)
+        std::string blockData(encodedNode.begin(), encodedNode.end());
+        storeBlock(cid.value(), blockData);
         
         return cid.value();
     }

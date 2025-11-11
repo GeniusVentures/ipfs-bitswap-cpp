@@ -17,10 +17,12 @@
 #include <libp2p/multi/content_identifier.hpp>
 #include <libp2p/outcome/outcome.hpp>
 #include <proto/unixfs.pb.h>
-#include <ipfs_lite/ipld/impl/ipld_node_decoder_pb.hpp>
 
 namespace sgns::ipfs_bitswap 
 {
+    // Forward declarations
+    class MerkledagDecoder;
+    
     typedef libp2p::multi::ContentIdentifier CID;
     typedef std::function<void(libp2p::outcome::result<std::string>)> BlockCallback;
 
@@ -381,10 +383,10 @@ namespace sgns::ipfs_bitswap
 
         // UnixFS content processing methods
         void processUnixFSBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const std::string& blockData, const std::string& path = "");
-        void handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& path = "");
+        void handleFileBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const MerkledagDecoder& decoder, const std::string& path = "");
         void handleFileChunk(std::shared_ptr<ContentRequestContext> ctx, const CID& chunkCid, const std::string& chunkData, size_t chunkIndex, const CID& parentCid);
         void assembleCompleteFile(std::shared_ptr<ContentRequestContext> ctx, const CID& fileCid, const ContentRequestContext::FileInProgress& fileProgress);
-        void handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const ipfs_lite::ipld::IPLDNodeDecoderPB& decoder, const std::string& basePath = "");
+        void handleDirectoryBlock(std::shared_ptr<ContentRequestContext> ctx, const CID& cid, const unixfs_pb::Data& unixfsData, const MerkledagDecoder& decoder, const std::string& basePath = "");
         void checkContentRequestComplete(std::shared_ptr<ContentRequestContext> ctx);
         UnixFSContent assembleContent(std::shared_ptr<ContentRequestContext> ctx);
         void processRequestQueue(std::shared_ptr<ContentRequestContext> ctx);
@@ -425,10 +427,14 @@ namespace sgns::ipfs_bitswap
         CID encodeChunkedFile(const std::vector<uint8_t>& content, const std::string& filePath);
         CID encodeAndStoreDirectory(const std::string& directoryPath);
         CID encodeAndStoreData(const std::vector<uint8_t>& data, unixfs_pb::Data::DataType type = unixfs_pb::Data::Raw);
-        std::vector<uint8_t> createUnixFSData(const std::vector<uint8_t>& content, unixfs_pb::Data::DataType type, 
+        std::string createUnixFSData(const std::vector<uint8_t>& content, unixfs_pb::Data::DataType type, 
                                               uint64_t filesize = 0, const std::vector<CID>& links = {});
-        CID createIPLDNode(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links = {});
-        CID createIPLDNodeAndStoreUnixFS(const std::vector<uint8_t>& unixfsData, const std::map<std::string, CID>& links = {});
+        CID createIPLDNode(const std::string& unixfsData, const std::map<std::string, CID>& links = {});
+        CID createIPLDNode(const std::string& unixfsData, const std::vector<CID>& orderedChunkCIDs);
+        CID createIPLDNodeAndStoreUnixFS(const std::string& unixfsData, const std::map<std::string, CID>& links = {});
+        CID createIPLDNodeAndStoreRawData(const std::vector<uint8_t>& rawData);
+        void analyzeIPLDStructure(const std::vector<uint8_t>& data, const std::string& label);
+        std::string bytesToHex(const std::vector<uint8_t>& bytes);
         void storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath = "");
         void handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream);
         void sendBlockResponse(const CID& cid, const std::string& blockData, std::shared_ptr<libp2p::connection::Stream> stream);

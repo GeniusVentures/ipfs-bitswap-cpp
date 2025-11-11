@@ -6,10 +6,15 @@ add_library(ipfs-bitswap-cpp
     bitswap_message.hpp
     logger.cpp
     logger.hpp
+    merkledag_encoder.hpp
+    merkledag_encoder.cpp
+    merkledag_decoder.hpp
+    merkledag_decoder.cpp
     )
 
 add_proto_library(ipfs-bitswap-proto proto/bitswap.proto)
 add_proto_library(ipfs-unixfs-proto proto/unixfs.proto)
+add_proto_library(ipfs-merkledag-proto proto/merkledag.proto)
 
 target_include_directories(ipfs-bitswap-cpp 
     PRIVATE ${GSL_INCLUDE_DIR}
@@ -19,12 +24,12 @@ target_link_libraries(ipfs-bitswap-cpp
     spdlog::spdlog
     ipfs-bitswap-proto
     ipfs-unixfs-proto
+    ipfs-merkledag-proto
     spdlog::spdlog
     Boost::Boost.DI
     p2p::p2p_basic_host
     p2p::p2p_multiaddress
     p2p::p2p_ping
-    ipfs-lite-cpp::ipld_node
     ${WIN_CRYPT_LIBRARY}
 )
 

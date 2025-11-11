@@ -66,6 +66,7 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/" DESTINATION "${CMAKE_INSTALL_INCLUD
 install(TARGETS ipfs-bitswap-cpp 
                 ipfs-bitswap-proto
                 ipfs-unixfs-proto
+                ipfs-merkledag-proto
         EXPORT ipfs-bitswap-cppTargets DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 
 install(EXPORT ipfs-bitswap-cppTargets
