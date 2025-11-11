@@ -66,7 +66,8 @@ namespace sgns::ipfs_bitswap
         std::string data;           // Raw block data
         CID cid;                   // Block's content identifier
         std::optional<std::string> filePath; // Original file path (if from file)
-        size_t size;
+        size_t size;                // IPLD block size (serialized size)
+        size_t contentSize;         // Total content size (for files, this is the actual file size)
         std::chrono::steady_clock::time_point addedTime;
     };
 
@@ -431,11 +432,13 @@ namespace sgns::ipfs_bitswap
                                               uint64_t filesize = 0, const std::vector<CID>& links = {});
         CID createIPLDNode(const std::string& unixfsData, const std::map<std::string, CID>& links = {});
         CID createIPLDNode(const std::string& unixfsData, const std::vector<CID>& orderedChunkCIDs);
+        CID createIPLDNodeWithContentSize(const std::string& unixfsData, const std::vector<CID>& orderedChunkCIDs, size_t totalContentSize);
         CID createIPLDNodeAndStoreUnixFS(const std::string& unixfsData, const std::map<std::string, CID>& links = {});
         CID createIPLDNodeAndStoreRawData(const std::vector<uint8_t>& rawData);
         void analyzeIPLDStructure(const std::vector<uint8_t>& data, const std::string& label);
         std::string bytesToHex(const std::vector<uint8_t>& bytes);
         void storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath = "");
+        void storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath, size_t contentSize);
         void handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream);
         void sendBlockResponse(const CID& cid, const std::string& blockData, std::shared_ptr<libp2p::connection::Stream> stream);
 

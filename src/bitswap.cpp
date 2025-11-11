@@ -1521,7 +1521,32 @@ namespace sgns::ipfs_bitswap {
         logger_->debug("==== End Chunked File Root UnixFS ====");
 
         // Create root IPLD node with ordered chunk CIDs (preserves order and allows duplicate empty names)
-        CID rootCID = createIPLDNode(serializedUnixFS, chunkCIDs);
+        // We'll calculate the total size after the root node is created
+        CID rootCID = createIPLDNodeWithContentSize(serializedUnixFS, chunkCIDs, content.size());
+        
+        // Now update the contentSize to include the total IPLD overhead
+        size_t totalSizeWithOverhead = 0;
+        {
+            std::lock_guard<std::mutex> guard(mutexBlockStore_);
+            // Sum all chunk IPLD sizes
+            for (const auto& chunkCID : chunkCIDs) {
+                auto it = blockStore_.find(chunkCID);
+                if (it != blockStore_.end()) {
+                    totalSizeWithOverhead += it->second.size; // IPLD block size including UnixFS wrapper
+                }
+            }
+            
+            // Add the root node's IPLD size
+            auto rootIt = blockStore_.find(rootCID);
+            if (rootIt != blockStore_.end()) {
+                totalSizeWithOverhead += rootIt->second.size;
+                // Update the contentSize to the total including all overhead
+                rootIt->second.contentSize = totalSizeWithOverhead;
+                
+                logger_->debug("Updated chunked file total contentSize: raw={}, withOverhead={}", 
+                              content.size(), totalSizeWithOverhead);
+            }
+        }
         
         logger_->debug("Created chunked file with {} chunks, root CID: {}", 
                       chunkCIDs.size(), 
@@ -1582,11 +1607,51 @@ namespace sgns::ipfs_bitswap {
             throw std::runtime_error("Failed to serialize UnixFS data for directory: " + directoryPath);
         }
 
+        // Debug: Show all directory links before creating IPLD node
+        logger_->debug("Creating directory IPLD node with {} links:", links.size());
+        for (const auto& [linkName, linkCid] : links) {
+            // Look up tsize for this link to show in debug
+            size_t linkTsize = 0;
+            {
+                std::lock_guard<std::mutex> guard(mutexBlockStore_);
+                auto it = blockStore_.find(linkCid);
+                if (it != blockStore_.end()) {
+                    linkTsize = it->second.size;
+                }
+            }
+            logger_->debug("  - Link: '{}' -> CID {} (tsize={})", linkName, cidToString(linkCid), linkTsize);
+        }
+
+        // Calculate total content size for this directory (sum of all content within)
+        size_t totalDirectoryContentSize = 0;
+        {
+            std::lock_guard<std::mutex> guard(mutexBlockStore_);
+            for (const auto& [linkName, linkCid] : links) {
+                auto it = blockStore_.find(linkCid);
+                if (it != blockStore_.end()) {
+                    totalDirectoryContentSize += it->second.contentSize;
+                }
+            }
+        }
+
         // Create IPLD node
         CID dirCID = createIPLDNode(serializedUnixFS, links);
         
-        logger_->debug("Created directory with {} entries, CID: {}", 
-                      links.size(), cidToString(dirCID));
+        // Update the stored block to have the correct content size (including directory's own IPLD size)
+        {
+            std::lock_guard<std::mutex> guard(mutexBlockStore_);
+            auto it = blockStore_.find(dirCID);
+            if (it != blockStore_.end()) {
+                // Include the directory's own IPLD size in its content size (like Kubo does)
+                size_t finalContentSize = totalDirectoryContentSize + it->second.size;
+                it->second.contentSize = finalContentSize;
+                logger_->debug("Updated directory CID {} contentSize: children={} + self={} = {} bytes", 
+                              cidToString(dirCID), totalDirectoryContentSize, it->second.size, finalContentSize);
+            }
+        }
+        
+        logger_->debug("Created directory with {} entries, CID: {}, total content size: {} bytes", 
+                      links.size(), cidToString(dirCID), totalDirectoryContentSize);
         
         return dirCID;
     }
@@ -1680,14 +1745,27 @@ namespace sgns::ipfs_bitswap {
                     std::lock_guard<std::mutex> guard(mutexBlockStore_);
                     auto it = blockStore_.find(cid);
                     if (it != blockStore_.end()) {
-                        link.tsize = it->second.size; // Total serialized IPLD size including UnixFS wrapper
-                        logger_->debug("Setting tsize for link to CID {}: {} bytes", 
+                        // For directory links, use contentSize (total file/directory content)
+                        // For file links, this will be the actual file size (5040065 for model.mnn)
+                        // For directory links, this will be the sum of all content within
+                        link.tsize = it->second.contentSize;
+                        logger_->debug("DIRECTORY LINK: {} -> CID {}: tsize={} bytes (contentSize)", 
+                                     name, 
                                      libp2p::multi::ContentIdentifierCodec::toString(cid).value(), 
                                      link.tsize);
                     } else {
                         link.tsize = 0; // Fallback if not found in block store
-                        logger_->warn("Could not find block size for CID {} in block store", 
+                        logger_->warn("DIRECTORY LINK MISSING: {} -> CID {} NOT FOUND in block store (using tsize=0)", 
+                                    name,
                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+                        
+                        // Debug: List all CIDs in block store
+                        logger_->debug("Current block store contains {} entries:", blockStore_.size());
+                        for (const auto& [storedCid, block] : blockStore_) {
+                            logger_->debug("  - CID {}: {} bytes", 
+                                         libp2p::multi::ContentIdentifierCodec::toString(storedCid).value(),
+                                         block.size);
+                        }
                     }
                 }
                 
@@ -1842,6 +1920,64 @@ namespace sgns::ipfs_bitswap {
         return cid.value();
     }
 
+    CID Bitswap::createIPLDNodeWithContentSize(const std::string& unixfsData, const std::vector<CID>& orderedChunkCIDs, size_t totalContentSize)
+    {
+        // Create MerkledagLinks from ordered chunk CIDs with empty names and correct tsize
+        std::vector<MerkledagLink> merkledagLinks;
+        for (const auto& cid : orderedChunkCIDs) {
+            // Get the raw CID bytes
+            auto cidResult = libp2p::multi::ContentIdentifierCodec::encode(cid);
+            if (cidResult.has_value()) {
+                MerkledagLink link;
+                link.name = ""; // Kubo uses empty strings for chunk link names
+                link.cid = std::move(cidResult.value());
+                
+                // Look up the total serialized size from the block store
+                {
+                    std::lock_guard<std::mutex> guard(mutexBlockStore_);
+                    auto it = blockStore_.find(cid);
+                    if (it != blockStore_.end()) {
+                        link.tsize = it->second.size; // Total serialized IPLD size including UnixFS wrapper
+                        logger_->debug("Setting tsize for chunk link to CID {}: {} bytes", 
+                                     libp2p::multi::ContentIdentifierCodec::toString(cid).value(), 
+                                     link.tsize);
+                    } else {
+                        link.tsize = 0; // Fallback if not found in block store
+                        logger_->warn("Could not find block size for CID {} in block store", 
+                                    libp2p::multi::ContentIdentifierCodec::toString(cid).value());
+                    }
+                }
+                
+                merkledagLinks.push_back(std::move(link));
+            }
+        }
+        
+        // Use Kubo-compatible MerkleDAG encoder
+        std::vector<uint8_t> encodedNode = MerkledagEncoder::encode(unixfsData, merkledagLinks);
+        
+        // Calculate CID for the encoded node
+        auto cidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0(encodedNode.data(), encodedNode.size());
+        
+        if (cidBytes.empty()) {
+            logger_->error("Failed to create CID for IPLD node");
+            throw std::runtime_error("Failed to create CID for IPLD node");
+        }
+        
+        auto cid = libp2p::multi::ContentIdentifierCodec::decode(
+            gsl::span(reinterpret_cast<const uint8_t*>(cidBytes.data()), cidBytes.size()));
+        
+        if (!cid) {
+            logger_->error("Failed to decode created CID: {}", cid.error().message());
+            throw std::runtime_error("Failed to decode created CID: " + cid.error().message());
+        }
+        
+        // Store the block with total content size for directory link tsize calculation
+        std::string blockData(encodedNode.begin(), encodedNode.end());
+        storeBlock(cid.value(), blockData, "", totalContentSize);
+        
+        return cid.value();
+    }
+
     CID Bitswap::createIPLDNodeAndStoreUnixFS(const std::string& unixfsData, const std::map<std::string, CID>& links)
     {
         // Convert links to the format expected by the Kubo-compatible encoder (preserving order)
@@ -1955,19 +2091,30 @@ namespace sgns::ipfs_bitswap {
 
     void Bitswap::storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath)
     {
+        // Default: contentSize = blockData.size() for chunks
+        storeBlock(cid, blockData, originalPath, blockData.size());
+    }
+
+    void Bitswap::storeBlock(const CID& cid, const std::string& blockData, const std::string& originalPath, size_t contentSize)
+    {
         std::lock_guard<std::mutex> guard(mutexBlockStore_);
         
         StoredBlock block{
             blockData,
             cid,
             originalPath.empty() ? std::nullopt : std::make_optional(originalPath),
-            blockData.size(),
+            blockData.size(),  // IPLD block size
+            contentSize,       // Total content size
             std::chrono::steady_clock::now()
         };
         
         blockStore_.emplace(cid, std::move(block));
         
-        logger_->debug("Stored block: {} ({} bytes)", cidToString(cid), blockData.size());
+        logger_->debug("BLOCK STORED: CID {} -> {} bytes IPLD, {} bytes content (path: {})", 
+                      cidToString(cid), 
+                      blockData.size(),
+                      contentSize,
+                      originalPath.empty() ? "none" : originalPath);
     }
 
     void Bitswap::handleWantlistRequest(const CID& wantedCid, std::shared_ptr<libp2p::connection::Stream> stream)

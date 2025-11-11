@@ -6,33 +6,41 @@ namespace sgns::ipfs_bitswap {
 
 std::vector<uint8_t> MerkledagEncoder::encode(const std::string& data, 
                                             const std::map<std::string, std::vector<uint8_t>>& links) {
-    // Create PBNode using protobuf
-    merkledag::pb::PBNode pbNode;
+    std::vector<uint8_t> result;
     
-    // Add links first (map order) - Kubo serializes Links before Data
+    // Manual encoding to match Kubo's exact field order: Links first, then Data
+    
+    // Field 2: Links (repeated PBLink) - encode first like Kubo
     for (const auto& [name, cidBytes] : links) {
-        merkledag::pb::PBLink* pbLink = pbNode.add_links();
+        std::vector<uint8_t> linkData;
         
-        // Set hash (CID bytes)
-        pbLink->set_hash(cidBytes.data(), cidBytes.size());
+        // PBLink.Hash = 1 (bytes)
+        auto hashField = encodeBytes(1, cidBytes);
+        linkData.insert(linkData.end(), hashField.begin(), hashField.end());
         
-        // Set name only if not empty (protobuf will automatically omit empty strings)
+        // PBLink.Name = 2 (string) - only encode if not empty for directories
         if (!name.empty()) {
-            pbLink->set_name(name);
+            auto nameField = encodeString(2, name);
+            linkData.insert(linkData.end(), nameField.begin(), nameField.end());
         }
         
-        // Set tsize to 0 for now (legacy behavior)
-        pbLink->set_tsize(0);
+        // PBLink.Tsize = 3 (uint64) - set to 0 for now (legacy behavior)
+        auto sizeField = encodeVarintField(3, 0);
+        linkData.insert(linkData.end(), sizeField.begin(), sizeField.end());
+        
+        // Encode the complete link as field 2 (length-delimited)
+        auto linkField = encodeBytes(2, linkData);
+        result.insert(result.end(), linkField.begin(), linkField.end());
     }
     
-    // Set data field last to match Kubo serialization order
+    // Field 1: Data (optional bytes) - encode last like Kubo
     if (!data.empty()) {
-        pbNode.set_data(data);
+        std::vector<uint8_t> dataBytes(data.begin(), data.end());
+        auto dataField = encodeBytes(1, dataBytes);
+        result.insert(result.end(), dataField.begin(), dataField.end());
     }
     
-    // Serialize to bytes
-    std::string serialized = pbNode.SerializeAsString();
-    return std::vector<uint8_t>(serialized.begin(), serialized.end());
+    return result;
 }
 
 std::vector<uint8_t> MerkledagEncoder::encode(const std::string& data, 
