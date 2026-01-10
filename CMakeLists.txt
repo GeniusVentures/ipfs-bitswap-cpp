@@ -1,5 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
-
+cmake_minimum_required(VERSION 3.22)
 
 project(ipfs-bitswap-cpp VERSION 0.1)
 
@@ -20,13 +19,13 @@ include(cmake/functions.cmake)
 
 # libp2p and its dependencies
 find_package(libp2p CONFIG REQUIRED)
-find_package(OpenSSL REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(tsl_hat_trie CONFIG REQUIRED)
 find_package(Boost.DI CONFIG REQUIRED)
 #find_package(c-ares CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(soralog CONFIG REQUIRED)
+find_package(ipfs-lite-cpp CONFIG REQUIRED)
 
 # BOOST library
 find_package(Boost REQUIRED COMPONENTS random filesystem date_time regex)
@@ -41,7 +40,7 @@ option(EXAMPLES "Build examples" OFF)
 if (TESTING OR EXAMPLES)
     find_package(GTest CONFIG REQUIRED)
     find_package(yaml-cpp CONFIG REQUIRED)
-    add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
+    #add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
     SET(WIN_CRYPT_LIBRARY)
     if (NOT UNIX)
         SET(WIN_CRYPT_LIBRARY crypt32)
@@ -66,6 +65,8 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/" DESTINATION "${CMAKE_INSTALL_INCLUD
 
 install(TARGETS ipfs-bitswap-cpp 
                 ipfs-bitswap-proto
+                ipfs-unixfs-proto
+                ipfs-merkledag-proto
         EXPORT ipfs-bitswap-cppTargets DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 
 install(EXPORT ipfs-bitswap-cppTargets
