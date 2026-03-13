@@ -1,5 +1,4 @@
-#ifndef MERKLEDAG_DECODER_HPP
-#define MERKLEDAG_DECODER_HPP
+#pragma once
 
 #include <vector>
 #include <string>
@@ -15,10 +14,6 @@ namespace sgns::ipfs_bitswap {
         libp2p::multi::ContentIdentifier cid;
         uint64_t size;
         
-        // Default constructor
-        DecodedLink() = default;
-        
-        // Constructor with parameters
         DecodedLink(const std::string& n, const libp2p::multi::ContentIdentifier& c, uint64_t s)
             : name(n), cid(c), size(s) {}
     };
@@ -75,6 +70,4 @@ namespace sgns::ipfs_bitswap {
         bool valid_ = false;
     };
 
-} // namespace sgns::ipfs_bitswap
-
-#endif // MERKLEDAG_DECODER_HPP
+}

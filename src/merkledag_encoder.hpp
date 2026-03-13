@@ -1,5 +1,4 @@
-#ifndef BITSWAP_MERKLEDAG_ENCODER_HPH
-#define BITSWAP_MERKLEDAG_ENCODER_HPP
+#pragma once
 
 #include <map>
 #include <string>
@@ -68,6 +67,4 @@ private:
     static uint32_t makeTag(uint32_t fieldNumber, uint32_t wireType);
 };
 
-} // namespace sgns::ipfs_bitswap
-
-#endif // BITSWAP_MERKLEDAG_ENCODER_HPP
+}
