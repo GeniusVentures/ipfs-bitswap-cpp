@@ -12,12 +12,6 @@ namespace sgns::ipfs_bitswap
     class BitswapMessage
     {
     public:
-        //enum class Error
-        //{
-        //    INVALID_ENTRY_INDEX = 1,
-        //    INVALID_BLOCK_INDEX
-        //};
-
         BitswapMessage( bitswap_pb::Message &pb_msg );
 
         void   AddWantlistEntry( const libp2p::multi::ContentIdentifier &cid, bool wantBlock );
@@ -34,5 +28,3 @@ namespace sgns::ipfs_bitswap
         Logger               logger_ = createLogger( "BitswapMessage" );
     };
 }
-
-//OUTCOME_HPP_DECLARE_ERROR_2(sgns::ipfs_bitswap, BitswapMessage::Error)

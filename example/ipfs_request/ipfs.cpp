@@ -77,7 +77,7 @@ groups:
       - name: libp2p
 # ----------------
   )" );
-} // namespace
+}
 
 int main( int argc, const char *argv[] )
 {

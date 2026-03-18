@@ -102,7 +102,7 @@ namespace
         }
         return 10;
     }
-} // namespace
+}
 
 namespace sgns::ipfs_bitswap
 {

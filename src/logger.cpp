@@ -29,7 +29,7 @@ namespace
         }
         return logger;
     }
-} // namespace
+}
 
 namespace sgns::ipfs_bitswap
 {
