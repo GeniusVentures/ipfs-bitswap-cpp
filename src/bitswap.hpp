@@ -1,5 +1,4 @@
-#ifndef IPFS_BITSWAP_HPP
-#define IPFS_BITSWAP_HPP
+#pragma once
 
 #include "logger.hpp"
 
@@ -455,5 +454,3 @@ namespace sgns::ipfs_bitswap
 }  // ipfs_bitswap
 
 OUTCOME_HPP_DECLARE_ERROR_2(sgns::ipfs_bitswap, BitswapError);
-
-#endif  // IPFS_BITSWAP_HPP
