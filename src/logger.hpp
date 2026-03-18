@@ -10,5 +10,5 @@ namespace sgns::ipfs_bitswap
     * @param tag - tagging name for identifying logger
     * @return logger object
     */
-    Logger createLogger(const std::string& tag);
+    Logger createLogger( const std::string &tag );
 }
