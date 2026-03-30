@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.22)
 
 project(ipfs-bitswap-cpp VERSION 0.1)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 include(GNUInstallDirs)
 
 message("Protobuf_DIR " ${Protobuf_DIR})

@@ -205,7 +205,7 @@ namespace sgns::ipfs_bitswap
         /**
         * In Bitswap, handle bitswap request
         */
-        void handle( StreamResult stream_res ) override;
+        void handle( libp2p::StreamAndProtocol stream_res ) override;
 
         /**
         * Start accepting bitswap requests
@@ -432,7 +432,6 @@ namespace sgns::ipfs_bitswap
 
         Logger logger_ = createLogger( "Bitswap" );
 
-    private:
         // Server-side encoding and storage methods
         CID         encodeAndStoreFile( const std::string &filePath );
         CID         encodeChunkedFile( const std::vector<uint8_t> &content, const std::string &filePath );

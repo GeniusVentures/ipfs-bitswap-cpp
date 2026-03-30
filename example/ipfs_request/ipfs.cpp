@@ -160,7 +160,7 @@ int main( int argc, const char *argv[] )
         [ping]( auto &&conn ) { return OnNewConnection( conn, ping ); } );
 
     host->setProtocolHandler( ping->getProtocolId(),
-                              [ping]( libp2p::protocol::BaseProtocol::StreamResult rstream )
+                              [ping]( libp2p::StreamAndProtocol rstream )
                               { ping->handle( std::move( rstream ) ); } );
 
     // Bitswap setup

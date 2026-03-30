@@ -5,13 +5,13 @@
 #include <proto/merkledag.pb.h>
 #include "merkledag_encoder.hpp"
 
+#include <memory>
 #include <string>
 #include <tuple>
 #include <fstream>
 #include <filesystem>
 #include <thread>
 #include <algorithm>
-#include <random>
 #include <functional>
 #include <sstream>
 #include <iomanip>
@@ -23,7 +23,7 @@
 
 #include <boost/assert.hpp>
 
-OUTCOME_CPP_DEFINE_CATEGORY_3( sgns::ipfs_bitswap, BitswapError, e )
+OUTCOME_CPP_DEFINE_CATEGORY( sgns::ipfs_bitswap, BitswapError, e )
 {
     using sgns::ipfs_bitswap::BitswapError;
     switch ( e )
@@ -62,7 +62,7 @@ namespace
     }
 
     // Helper function to calculate varint encoded length
-    uint64_t getVarintEncodedLength( uint64_t value )
+    constexpr uint64_t getVarintEncodedLength( uint64_t value )
     {
         if ( value < 0x80 )
         {
@@ -151,7 +151,7 @@ namespace sgns::ipfs_bitswap
     {
         // Register this bitswap instance as the protocol handler for bitswap protocol
         host_.getRouter().setProtocolHandler(
-            getProtocolId(),
+            { getProtocolId() },
             [weak_self = std::weak_ptr<Bitswap>( shared_from_this() )]( auto stream_result )
             {
                 if ( auto self = weak_self.lock() )
@@ -166,182 +166,174 @@ namespace sgns::ipfs_bitswap
         return bitswapProtocolId;
     }
 
-    void Bitswap::handle( libp2p::protocol::BaseProtocol::StreamResult rstream )
+    void Bitswap::handle( libp2p::StreamAndProtocol rstream )
     {
-        if ( !rstream )
+        if ( !rstream.stream )
         {
             return;
         }
 
-        auto &stream = rstream.value();
+        auto &stream = rstream.stream;
         logStreamState( "accepted stream from peer", *stream );
 
         // Current yamux stream implementation allows to read pending data from a stream that is
         // closed for read.
-        bool isStreamClosedForRead = false;
 
-        if ( !isStreamClosedForRead )
-        {
-            auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>( stream );
-            rw->read<bitswap_pb::Message>(
-                [ctx = shared_from_this(), stream, rw]( libp2p::outcome::result<bitswap_pb::Message> rmsg )
+        auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>( stream );
+        rw->read<bitswap_pb::Message>(
+            [ctx = shared_from_this(), stream, rw]( libp2p::outcome::result<bitswap_pb::Message> rmsg )
+            {
+                if ( !rmsg )
                 {
-                    if ( !rmsg )
+                    ctx->logger_->error( "bitswap message cannot be decoded" );
+                    return;
+                }
+
+                BitswapMessage msg( rmsg.value() );
+
+                // If we receive a message with wantlist items, we act as a server
+                // If we receive a message with blocks, we act as a client
+                bool hasWantlist = msg.GetWantlistSize() > 0;
+                bool hasBlocks   = msg.GetBlocksSize() > 0;
+
+                // Process wantlist requests (server side)
+                for ( int i = 0; i < msg.GetWantlistSize(); ++i )
+                {
+                    auto blockId = msg.GetWantlistEntry( i ).block();
+                    auto cid     = libp2p::multi::ContentIdentifierCodec::decode(
+                        gsl::span( (uint8_t *)blockId.data(), blockId.size() ) );
+                    if ( cid )
                     {
-                        ctx->logger_->error( "bitswap message cannot be decoded" );
-                        return;
+                        // Check if we have this block and respond
+                        ctx->handleWantlistRequest( cid.value(), stream );
                     }
+                }
 
-                    BitswapMessage msg( rmsg.value() );
+                // Process blocks (client side)
+                for ( int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx )
+                {
+                    const auto &block = msg.GetBlock( blockIdx );
 
-                    // If we receive a message with wantlist items, we act as a server
-                    // If we receive a message with blocks, we act as a client
-                    bool hasWantlist = msg.GetWantlistSize() > 0;
-                    bool hasBlocks   = msg.GetBlocksSize() > 0;
-
-                    // Process wantlist requests (server side)
-                    for ( int i = 0; i < msg.GetWantlistSize(); ++i )
+                    auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0( block.data(), block.size() );
+                    auto cid   = libp2p::multi::ContentIdentifierCodec::decode(
+                        gsl::span( (uint8_t *)cidV0.data(), cidV0.size() ) );
+                    if ( !cid )
                     {
-                        auto blockId = msg.GetWantlistEntry( i ).block();
-                        auto cid     = libp2p::multi::ContentIdentifierCodec::decode(
-                            gsl::span( (uint8_t *)blockId.data(), blockId.size() ) );
-                        if ( cid )
-                        {
-                            // Check if we have this block and respond
-                            ctx->handleWantlistRequest( cid.value(), stream );
-                        }
+                        ctx->logger_->error( "CID cannot be decoded. {}", cid.error().message() );
                     }
-
-                    // Process blocks (client side)
-                    for ( int blockIdx = 0; blockIdx < msg.GetBlocksSize(); ++blockIdx )
+                    else
                     {
-                        const auto &block = msg.GetBlock( blockIdx );
+                        auto scid = libp2p::multi::ContentIdentifierCodec::toString( cid.value() ).value();
 
-                        auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0( block.data(), block.size() );
-                        auto cid   = libp2p::multi::ContentIdentifierCodec::decode(
-                            gsl::span( (uint8_t *)cidV0.data(), cidV0.size() ) );
-                        if ( !cid )
+                        std::lock_guard<std::mutex> callbacksGuard( ctx->mutexRequestCallbacks_ );
+
+                        auto itContext = ctx->requestContexts_.find( cid.value() );
+                        if ( itContext != ctx->requestContexts_.end() )
                         {
-                            ctx->logger_->error( "CID cannot be decoded. {}", cid.error().message() );
+                            // Mark provider success
+                            if ( auto remotePeer = stream->remotePeerId() )
+                            {
+                                ctx->markProviderSuccess( cid.value(), remotePeer.value() );
+                            }
+
+                            itContext->second->HandleResponse( block );
                         }
                         else
                         {
-                            auto scid = libp2p::multi::ContentIdentifierCodec::toString( cid.value() ).value();
-
-                            std::lock_guard<std::mutex> callbacksGuard( ctx->mutexRequestCallbacks_ );
-
-                            auto itContext = ctx->requestContexts_.find( cid.value() );
-                            if ( itContext != ctx->requestContexts_.end() )
-                            {
-                                // Mark provider success
-                                if ( auto remotePeer = stream->remotePeerId() )
-                                {
-                                    ctx->markProviderSuccess( cid.value(), remotePeer.value() );
-                                }
-
-                                itContext->second->HandleResponse( block );
-                            }
-                            else
-                            {
-                                ctx->logger_->warn( "No request context found for received block CID: {}", scid );
-                            }
+                            ctx->logger_->warn( "No request context found for received block CID: {}", scid );
                         }
                     }
+                }
 
-                    // Set up continuous reading based on what we received
-                    if ( hasWantlist && !hasBlocks )
+                // Set up continuous reading based on what we received
+                if ( hasWantlist && !hasBlocks )
+                {
+                    // We're a server that received a wantlist - set up continuous reading
+
+                    // Lambda function for recursive server reading
+                    std::function<void()> setupServerRead =
+                        [ctx, stream, rw, setupServerRead = std::make_shared<std::function<void()>>()]() mutable
                     {
-                        // We're a server that received a wantlist - set up continuous reading
-
-                        // Lambda function for recursive server reading
-                        std::function<void()> setupServerRead =
-                            [ctx,
-                             stream,
-                             rw,
-                             setupServerRead = std::shared_ptr<std::function<void()>>(
-                                 new std::function<void()> )]() mutable
+                        *setupServerRead = [ctx, stream, rw, setupServerRead]()
                         {
-                            *setupServerRead = [ctx, stream, rw, setupServerRead]()
-                            {
-                                rw->read<bitswap_pb::Message>(
-                                    [ctx, stream, rw, setupServerRead](
-                                        libp2p::outcome::result<bitswap_pb::Message> nextMsg )
+                            rw->read<bitswap_pb::Message>(
+                                [ctx, stream, rw, setupServerRead](
+                                    libp2p::outcome::result<bitswap_pb::Message> nextMsg )
+                                {
+                                    if ( nextMsg )
                                     {
-                                        if ( nextMsg )
+                                        BitswapMessage nextBitswapMsg( nextMsg.value() );
+
+                                        bool nextHasWantlist = nextBitswapMsg.GetWantlistSize() > 0;
+                                        bool nextHasBlocks   = nextBitswapMsg.GetBlocksSize() > 0;
+
+                                        // Process wantlist requests (server side)
+                                        for ( int i = 0; i < nextBitswapMsg.GetWantlistSize(); ++i )
                                         {
-                                            BitswapMessage nextBitswapMsg( nextMsg.value() );
-
-                                            bool nextHasWantlist = nextBitswapMsg.GetWantlistSize() > 0;
-                                            bool nextHasBlocks   = nextBitswapMsg.GetBlocksSize() > 0;
-
-                                            // Process wantlist requests (server side)
-                                            for ( int i = 0; i < nextBitswapMsg.GetWantlistSize(); ++i )
+                                            auto blockId = nextBitswapMsg.GetWantlistEntry( i ).block();
+                                            auto cid     = libp2p::multi::ContentIdentifierCodec::decode(
+                                                gsl::span( (uint8_t *)blockId.data(), blockId.size() ) );
+                                            if ( cid )
                                             {
-                                                auto blockId = nextBitswapMsg.GetWantlistEntry( i ).block();
-                                                auto cid     = libp2p::multi::ContentIdentifierCodec::decode(
-                                                    gsl::span( (uint8_t *)blockId.data(), blockId.size() ) );
-                                                if ( cid )
-                                                {
-                                                    ctx->handleWantlistRequest( cid.value(), stream );
-                                                }
-                                            }
-
-                                            // Continue reading for more requests
-                                            if ( nextHasWantlist && !nextHasBlocks )
-                                            {
-                                                ( *setupServerRead )();
+                                                ctx->handleWantlistRequest( cid.value(), stream );
                                             }
                                         }
-                                    } );
-                            };
-                            ( *setupServerRead )();
-                        };
 
-                        setupServerRead();
-                    }
-                    else if ( !hasWantlist && !hasBlocks )
-                    {
-                        // We're a client that sent a wantlist and haven't received blocks yet
-                        rw->read<bitswap_pb::Message>(
-                            [ctx, stream, rw]( libp2p::outcome::result<bitswap_pb::Message> nextMsg )
-                            {
-                                if ( nextMsg )
-                                {
-                                    BitswapMessage nextBitswapMsg( nextMsg.value() );
-
-                                    // Process blocks in the response
-                                    for ( int blockIdx = 0; blockIdx < nextBitswapMsg.GetBlocksSize(); ++blockIdx )
-                                    {
-                                        const auto &block = nextBitswapMsg.GetBlock( blockIdx );
-
-                                        auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0( block.data(),
-                                                                                                         block.size() );
-                                        auto cid   = libp2p::multi::ContentIdentifierCodec::decode(
-                                            gsl::span( (uint8_t *)cidV0.data(), cidV0.size() ) );
-                                        if ( cid )
+                                        // Continue reading for more requests
+                                        if ( nextHasWantlist && !nextHasBlocks )
                                         {
-                                            auto scid = libp2p::multi::ContentIdentifierCodec::toString( cid.value() )
-                                                            .value();
+                                            ( *setupServerRead )();
+                                        }
+                                    }
+                                } );
+                        };
+                        ( *setupServerRead )();
+                    };
 
-                                            std::lock_guard<std::mutex> callbacksGuard( ctx->mutexRequestCallbacks_ );
-                                            auto itContext = ctx->requestContexts_.find( cid.value() );
-                                            if ( itContext != ctx->requestContexts_.end() )
+                    setupServerRead();
+                }
+                else if ( !hasWantlist && !hasBlocks )
+                {
+                    // We're a client that sent a wantlist and haven't received blocks yet
+                    rw->read<bitswap_pb::Message>(
+                        [ctx, stream, rw]( libp2p::outcome::result<bitswap_pb::Message> nextMsg )
+                        {
+                            if ( nextMsg )
+                            {
+                                BitswapMessage nextBitswapMsg( nextMsg.value() );
+
+                                // Process blocks in the response
+                                for ( int blockIdx = 0; blockIdx < nextBitswapMsg.GetBlocksSize(); ++blockIdx )
+                                {
+                                    const auto &block = nextBitswapMsg.GetBlock( blockIdx );
+
+                                    auto cidV0 = libp2p::multi::ContentIdentifierCodec::encodeCIDV0( block.data(),
+                                                                                                     block.size() );
+                                    auto cid   = libp2p::multi::ContentIdentifierCodec::decode(
+                                        gsl::span( (uint8_t *)cidV0.data(), cidV0.size() ) );
+                                    if ( cid )
+                                    {
+                                        auto scid = libp2p::multi::ContentIdentifierCodec::toString( cid.value() )
+                                                        .value();
+
+                                        std::lock_guard<std::mutex> callbacksGuard( ctx->mutexRequestCallbacks_ );
+                                        auto itContext = ctx->requestContexts_.find( cid.value() );
+                                        if ( itContext != ctx->requestContexts_.end() )
+                                        {
+                                            // Mark provider success
+                                            if ( auto remotePeer = stream->remotePeerId() )
                                             {
-                                                // Mark provider success
-                                                if ( auto remotePeer = stream->remotePeerId() )
-                                                {
-                                                    ctx->markProviderSuccess( cid.value(), remotePeer.value() );
-                                                }
-
-                                                itContext->second->HandleResponse( block );
+                                                ctx->markProviderSuccess( cid.value(), remotePeer.value() );
                                             }
+
+                                            itContext->second->HandleResponse( block );
                                         }
                                     }
                                 }
-                            } );
-                    }
-                } );
-        }
+                            }
+                        } );
+                }
+            } );
     }
 
     void Bitswap::start()
@@ -350,8 +342,8 @@ namespace sgns::ipfs_bitswap
         BOOST_ASSERT( !started_ );
         started_ = true;
 
-        host_.setProtocolHandler( bitswapProtocolId,
-                                  [wp = weak_from_this()]( libp2p::protocol::BaseProtocol::StreamResult rstream )
+        host_.setProtocolHandler( { bitswapProtocolId },
+                                  [wp = weak_from_this()]( libp2p::StreamAndProtocol rstream )
                                   {
                                       if ( auto self = wp.lock() )
                                       {
@@ -630,7 +622,7 @@ namespace sgns::ipfs_bitswap
                 writeBitswapMessageToStream( streamIt->second, cid, std::move( onBlockCallback ) );
                 return;
             }
-            else if ( streamIt != activeStreams_.end() )
+            if ( streamIt != activeStreams_.end() )
             {
                 // Remove closed stream from cache
                 activeStreams_.erase( streamIt );
@@ -652,14 +644,14 @@ namespace sgns::ipfs_bitswap
 
         host_.newStream(
             pi,
-            bitswapProtocolId,
+            { bitswapProtocolId },
             [wp = weak_from_this(),
              cid( cid ),
              pi( pi ),
              onBlockCallback = std::move( onBlockCallback ),
              retryCount,
              maxRetries,
-             baseDelayMs]( libp2p::protocol::BaseProtocol::StreamResult rstream ) mutable
+             baseDelayMs]( libp2p::StreamAndProtocolOrError rstream ) mutable
             {
                 auto ctx = wp.lock();
                 if ( ctx )
@@ -711,7 +703,7 @@ namespace sgns::ipfs_bitswap
                     }
                     else
                     {
-                        auto stream = rstream.value();
+                        auto stream = rstream.value().stream;
                         ctx->logStreamState( "outbound stream created", *stream );
 
                         // Cache the stream for reuse
@@ -2007,11 +1999,11 @@ namespace sgns::ipfs_bitswap
                 {
                     std::lock_guard<std::mutex> guard( mutexBlockStore_ );
                     PublishedContent            content{ filePath,
-                                              rootCID,
+                                                         rootCID,
                                                          {},
-                                              UnixFSContent::SINGLE_FILE,
-                                              0,
-                                              std::chrono::steady_clock::now() };
+                                                         UnixFSContent::SINGLE_FILE,
+                                                         0,
+                                                         std::chrono::steady_clock::now() };
 
                     // Collect all blocks that belong to this content
                     // For now, we'll just include the root block, but this should be enhanced
@@ -2053,11 +2045,11 @@ namespace sgns::ipfs_bitswap
                 {
                     std::lock_guard<std::mutex> guard( mutexBlockStore_ );
                     PublishedContent            content{ directoryPath,
-                                              rootCID,
+                                                         rootCID,
                                                          {},
-                                              UnixFSContent::DIRECTORY,
-                                              0,
-                                              std::chrono::steady_clock::now() };
+                                                         UnixFSContent::DIRECTORY,
+                                                         0,
+                                                         std::chrono::steady_clock::now() };
 
                     // Collect all blocks that belong to this content
                     // This should include all files and subdirectories
@@ -2100,11 +2092,11 @@ namespace sgns::ipfs_bitswap
         {
             std::lock_guard<std::mutex> guard( mutexBlockStore_ );
             PublishedContent            content{ "", // No file path for raw data
-                                      rootCID,
+                                                 rootCID,
                                                  {},
-                                      UnixFSContent::SINGLE_FILE,
-                                      0,
-                                      std::chrono::steady_clock::now() };
+                                                 UnixFSContent::SINGLE_FILE,
+                                                 0,
+                                                 std::chrono::steady_clock::now() };
 
             auto blockIt = blockStore_.find( rootCID );
             if ( blockIt != blockStore_.end() )
