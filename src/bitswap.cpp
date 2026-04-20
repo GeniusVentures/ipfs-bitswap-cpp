@@ -723,11 +723,15 @@ namespace sgns::ipfs_bitswap
     {
         if ( logger_->should_log( spdlog::level::debug ) )
         {
+            const auto remote_peer_res = stream.remotePeerId();
+            const auto remote_addr_res = stream.remoteMultiaddr();
+            const auto local_addr_res  = stream.localMultiaddr();
+
             logger_->debug( "{}: {}, {}, {}, isClosed: {}, canRead: {}, canWrite: {}",
                             message,
-                            stream.remotePeerId().value().toBase58(),
-                            stream.remoteMultiaddr().value().getStringAddress(),
-                            stream.localMultiaddr().value().getStringAddress(),
+                            remote_peer_res ? remote_peer_res.value().toBase58() : "<no-remote-peer>",
+                            remote_addr_res ? remote_addr_res.value().getStringAddress() : "<no-remote-addr>",
+                            local_addr_res ? local_addr_res.value().getStringAddress() : "<no-local-addr>",
                             stream.isClosed(),
                             !stream.isClosedForRead(),
                             !stream.isClosedForWrite() );
