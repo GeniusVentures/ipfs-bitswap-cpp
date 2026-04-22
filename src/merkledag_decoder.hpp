@@ -1,8 +1,8 @@
 #pragma once
 
+#include <utility>
 #include <vector>
 #include <string>
-#include <map>
 #include <optional>
 #include <libp2p/multi/content_identifier.hpp>
 #include <proto/merkledag.pb.h>
@@ -16,8 +16,8 @@ namespace sgns::ipfs_bitswap
         libp2p::multi::ContentIdentifier cid;
         uint64_t                         size;
 
-        DecodedLink( const std::string &n, const libp2p::multi::ContentIdentifier &c, uint64_t s ) :
-            name( n ), cid( c ), size( s )
+        DecodedLink( std::string n, libp2p::multi::ContentIdentifier c, uint64_t s ) :
+            name(std::move( n )), cid(std::move( c )), size( s )
         {
         }
     };
@@ -74,5 +74,4 @@ namespace sgns::ipfs_bitswap
         merkledag::pb::PBNode node_;
         bool                  valid_ = false;
     };
-
 }
