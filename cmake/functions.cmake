@@ -55,9 +55,11 @@ endfunction()
 
 function(add_proto_library NAME)
   set(SOURCES "")
+  set(HEADERS "")
   foreach (PROTO IN ITEMS ${ARGN})
     compile_proto_to_cpp(H C ${PROTO})
     list(APPEND SOURCES ${H} ${C})
+    list(APPEND HEADERS ${H})
   endforeach ()
 
   add_library(${NAME}
@@ -71,6 +73,14 @@ function(add_proto_library NAME)
       $<INSTALL_INTERFACE:include> 
   )
   disable_clang_tidy(${NAME})
+  
+  # Install the generated headers
+  foreach(HEADER ${HEADERS})
+    get_filename_component(HEADER_NAME ${HEADER} NAME)
+    get_filename_component(HEADER_DIR ${HEADER} DIRECTORY)
+    file(RELATIVE_PATH REL_HEADER_DIR ${CMAKE_BINARY_DIR}/generated ${HEADER_DIR})
+    install(FILES ${HEADER} DESTINATION include/${REL_HEADER_DIR})
+  endforeach()
   
   add_dependencies(generated ${NAME})
 endfunction()
