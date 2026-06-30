@@ -216,6 +216,13 @@ namespace sgns::ipfs_bitswap
         bool                                 UnpublishContent( const CID &rootCid );
         std::vector<PublishedContent>        ListPublishedContent() const;
 
+        // --- Disk persistence (lazy-load) ---
+        void setCacheDir( const std::string &dir );
+        std::string getCacheDir() const;
+        void buildDiskIndex();
+        void persistBlock( const CID &cid, const std::string &blockData );
+        void unpersistBlock( const CID &cid );
+
     private:
         void onNewConnection( const std::weak_ptr<libp2p::connection::CapableConnection> &conn );
         void writeBitswapMessageToStream( std::shared_ptr<libp2p::connection::Stream> stream,
@@ -289,6 +296,10 @@ namespace sgns::ipfs_bitswap
                                 const std::string                          &blockData,
                                 std::shared_ptr<libp2p::connection::Stream> stream );
 
+        // Disk persistence helpers
+        bool tryLoadFromDisk( const CID &cid );
+        std::string cidToFilePath( const std::string &cidStr ) const;
+
         // Provider management helpers
         libp2p::peer::PeerInfo selectBestProvider( const CID &cid );
         void                   markProviderFailure( const CID &cid, const libp2p::peer::PeerId &peerId );
@@ -322,6 +333,11 @@ namespace sgns::ipfs_bitswap
         mutable std::mutex              mutexBlockStore_;
         std::map<CID, StoredBlock>      blockStore_;
         std::map<CID, PublishedContent> publishedContent_;
+
+        // Disk persistence
+        std::string                cacheDir_;
+        mutable std::mutex         mutexDiskIndex_;
+        std::set<std::string>      diskIndex_;
 
         mutable std::mutex                       mutexProviders_;
         std::map<CID, std::vector<PeerProvider>> providers_;

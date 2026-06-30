@@ -112,6 +112,7 @@ namespace sgns::ipfs_bitswap
                     self->handle( std::move( stream_result ) );
                 }
             } );
+        buildDiskIndex();
     }
 
     libp2p::peer::Protocol Bitswap::getProtocolId() const
@@ -1292,23 +1293,40 @@ namespace sgns::ipfs_bitswap
                               const std::string &originalPath,
                               size_t             contentSize )
     {
-        std::lock_guard<std::mutex> guard( mutexBlockStore_ );
-        blockStore_.emplace( cid,
-                             StoredBlock{ blockData,
-                                          cid,
-                                          originalPath.empty() ? std::nullopt : std::make_optional( originalPath ),
-                                          blockData.size(),
-                                          contentSize > 0 ? contentSize : blockData.size(),
-                                          std::chrono::steady_clock::now() } );
+        {
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            blockStore_.emplace( cid,
+                                 StoredBlock{ blockData,
+                                              cid,
+                                              originalPath.empty() ? std::nullopt : std::make_optional( originalPath ),
+                                              blockData.size(),
+                                              contentSize > 0 ? contentSize : blockData.size(),
+                                              std::chrono::steady_clock::now() } );
+        }
+        persistBlock( cid, blockData );
     }
 
     void Bitswap::handleWantlistRequest( const CID &wantedCid, std::shared_ptr<libp2p::connection::Stream> stream )
     {
-        std::lock_guard<std::mutex> guard( mutexBlockStore_ );
-        auto                        blockIt = blockStore_.find( wantedCid );
-        if ( blockIt != blockStore_.end() )
         {
-            sendBlockResponse( wantedCid, blockIt->second.data, stream );
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            auto                        blockIt = blockStore_.find( wantedCid );
+            if ( blockIt != blockStore_.end() )
+            {
+                sendBlockResponse( wantedCid, blockIt->second.data, stream );
+                return;
+            }
+        }
+        // Lazy-load from disk if available
+        if ( tryLoadFromDisk( wantedCid ) )
+        {
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            auto                        blockIt = blockStore_.find( wantedCid );
+            if ( blockIt != blockStore_.end() )
+            {
+                sendBlockResponse( wantedCid, blockIt->second.data, stream );
+                return;
+            }
         }
     }
 
@@ -1447,19 +1465,39 @@ namespace sgns::ipfs_bitswap
 
     bool Bitswap::HasBlock( const CID &cid ) const
     {
-        std::lock_guard<std::mutex> guard( mutexBlockStore_ );
-        return blockStore_.count( cid ) > 0;
+        {
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            if ( blockStore_.count( cid ) > 0 )
+            {
+                return true;
+            }
+        }
+        // Check disk index as fallback
+        auto cidStr = cidToString( cid );
+        std::lock_guard<std::mutex> guard( mutexDiskIndex_ );
+        return diskIndex_.count( cidStr ) > 0;
     }
 
     libp2p::outcome::result<std::string> Bitswap::GetBlock( const CID &cid ) const
     {
-        std::lock_guard<std::mutex> guard( mutexBlockStore_ );
-        auto                        blockIt = blockStore_.find( cid );
-        if ( blockIt != blockStore_.end() )
         {
-            return blockIt->second.data;
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            auto                        blockIt = blockStore_.find( cid );
+            if ( blockIt != blockStore_.end() )
+            {
+                return blockIt->second.data;
+            }
         }
-
+        // Lazy-load from disk if available
+        if ( const_cast<Bitswap *>( this )->tryLoadFromDisk( cid ) )
+        {
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            auto                        blockIt = blockStore_.find( cid );
+            if ( blockIt != blockStore_.end() )
+            {
+                return blockIt->second.data;
+            }
+        }
         return BitswapError::BLOCK_NOT_FOUND;
     }
 
@@ -1861,5 +1899,200 @@ namespace sgns::ipfs_bitswap
                             attemptCount + 1 );
             onBlockCallback( BitswapError::OUTBOUND_STREAM_FAILURE );
         }
+    }
+
+    // ===================================================================
+    // Disk Persistence Implementation
+    // ===================================================================
+
+    void Bitswap::setCacheDir( const std::string &dir )
+    {
+        cacheDir_ = dir;
+        if ( !dir.empty() )
+        {
+            logger_->info( "Bitswap disk cache directory set to: {}", dir );
+        }
+    }
+
+    std::string Bitswap::getCacheDir() const
+    {
+        return cacheDir_;
+    }
+
+    void Bitswap::buildDiskIndex()
+    {
+        if ( cacheDir_.empty() )
+        {
+            return;
+        }
+
+        namespace fs = std::filesystem;
+        if ( !fs::exists( cacheDir_ ) || !fs::is_directory( cacheDir_ ) )
+        {
+            logger_->debug( "Bitswap cache directory does not exist, skipping disk index build: {}", cacheDir_ );
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> guard( mutexDiskIndex_ );
+            diskIndex_.clear();
+        }
+
+        size_t count = 0;
+        for ( const auto &entry : fs::directory_iterator( cacheDir_ ) )
+        {
+            if ( entry.is_regular_file() )
+            {
+                std::string cidStr = entry.path().filename().string();
+                {
+                    std::lock_guard<std::mutex> guard( mutexDiskIndex_ );
+                    diskIndex_.insert( cidStr );
+                }
+                ++count;
+            }
+        }
+
+        logger_->info( "Built disk index from {}: {} CIDs available", cacheDir_, count );
+    }
+
+    std::string Bitswap::cidToFilePath( const std::string &cidStr ) const
+    {
+        return cacheDir_ + "/" + cidStr;
+    }
+
+    void Bitswap::persistBlock( const CID &cid, const std::string &blockData )
+    {
+        if ( cacheDir_.empty() )
+        {
+            return;
+        }
+
+        auto cidStr = cidToString( cid );
+        if ( cidStr == "invalid" )
+        {
+            return;
+        }
+
+        // Add to in-memory disk index
+        {
+            std::lock_guard<std::mutex> guard( mutexDiskIndex_ );
+            diskIndex_.insert( cidStr );
+        }
+
+        // Ensure cache directory exists
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if ( !fs::exists( cacheDir_, ec ) )
+        {
+            fs::create_directories( cacheDir_, ec );
+            if ( ec )
+            {
+                logger_->warn( "Failed to create cache directory {}: {}", cacheDir_, ec.message() );
+                return;
+            }
+        }
+
+        // Write block to flat file
+        auto filePath = cidToFilePath( cidStr );
+        std::ofstream file( filePath, std::ios::binary );
+        if ( !file.is_open() )
+        {
+            logger_->warn( "Failed to open cache file for writing: {}", filePath );
+            return;
+        }
+        file.write( blockData.data(), blockData.size() );
+        file.close();
+
+        logger_->debug( "Persisted block to disk: {} ({} bytes)", cidStr, blockData.size() );
+    }
+
+    void Bitswap::unpersistBlock( const CID &cid )
+    {
+        if ( cacheDir_.empty() )
+        {
+            return;
+        }
+
+        auto cidStr = cidToString( cid );
+        if ( cidStr == "invalid" )
+        {
+            return;
+        }
+
+        auto filePath = cidToFilePath( cidStr );
+        std::error_code ec;
+        if ( std::filesystem::exists( filePath, ec ) )
+        {
+            std::filesystem::remove( filePath, ec );
+            if ( ec )
+            {
+                logger_->warn( "Failed to remove cache file {}: {}", filePath, ec.message() );
+            }
+            else
+            {
+                logger_->debug( "Removed block from disk: {}", cidStr );
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> guard( mutexDiskIndex_ );
+            diskIndex_.erase( cidStr );
+        }
+    }
+
+    bool Bitswap::tryLoadFromDisk( const CID &cid )
+    {
+        if ( cacheDir_.empty() )
+        {
+            return false;
+        }
+
+        auto cidStr = cidToString( cid );
+        if ( cidStr == "invalid" )
+        {
+            return false;
+        }
+
+        // Check disk index first (fast path, no I/O)
+        {
+            std::lock_guard<std::mutex> guard( mutexDiskIndex_ );
+            if ( diskIndex_.count( cidStr ) == 0 )
+            {
+                return false;
+            }
+        }
+
+        auto filePath = cidToFilePath( cidStr );
+        std::ifstream file( filePath, std::ios::binary | std::ios::ate );
+        if ( !file.is_open() )
+        {
+            // File disappeared — remove from index
+            std::lock_guard<std::mutex> guard( mutexDiskIndex_ );
+            diskIndex_.erase( cidStr );
+            logger_->debug( "Cache file missing, removed from index: {}", cidStr );
+            return false;
+        }
+
+        auto fileSize = static_cast<size_t>( file.tellg() );
+        file.seekg( 0, std::ios::beg );
+
+        std::string blockData( fileSize, '\0' );
+        file.read( blockData.data(), fileSize );
+        file.close();
+
+        // Store in memory
+        {
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            blockStore_.emplace( cid,
+                                 StoredBlock{ blockData,
+                                              cid,
+                                              std::nullopt,
+                                              fileSize,
+                                              fileSize,
+                                              std::chrono::steady_clock::now() } );
+        }
+
+        logger_->debug( "Lazy-loaded block from disk: {} ({} bytes)", cidStr, fileSize );
+        return true;
     }
 }
