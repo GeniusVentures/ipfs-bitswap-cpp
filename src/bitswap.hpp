@@ -213,7 +213,7 @@ namespace sgns::ipfs_bitswap
 
         // --- Local block store ---
         bool                                 HasBlock( const CID &cid ) const;
-        libp2p::outcome::result<std::string> GetBlock( const CID &cid ) const;
+        libp2p::outcome::result<std::string> GetBlock( const CID &cid );
         bool                                 UnpublishContent( const CID &rootCid );
         std::vector<PublishedContent>        ListPublishedContent() const;
 
