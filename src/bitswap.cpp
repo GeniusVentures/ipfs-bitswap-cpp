@@ -161,6 +161,10 @@ namespace sgns::ipfs_bitswap
                 // Process blocks (client side)
                 ctx->processReceivedBlocks( msg, stream );
 
+                // Server read loop: persists on the libp2p I/O thread via recursive
+                // async read continuations. Each completion re-arms the read for the
+                // next wantlist message from the peer. This thread identity is
+                // inherited from the libp2p protocol handler dispatch.
                 // Set up continuous reading for server mode
                 if ( hasWantlist && !hasBlocks )
                 {
@@ -1791,41 +1795,6 @@ namespace sgns::ipfs_bitswap
                         peerId.toBase58(),
                         cidToString( cid ),
                         p->failureCount );
-    }
-
-    void Bitswap::cleanupStaleProviders()
-    {
-        std::lock_guard<std::mutex> guard( mutexProviders_ );
-
-        auto now            = std::chrono::steady_clock::now();
-        auto staleThreshold = std::chrono::hours( 1 );
-
-        for ( auto providerIt = providers_.begin(); providerIt != providers_.end(); )
-        {
-            auto &pl     = providerIt->second;
-            auto  newEnd = std::remove_if( pl.begin(),
-                                           pl.end(),
-                                           [&]( const PeerProvider &p )
-                                           { return ( now - p.lastSeen ) > staleThreshold; } );
-
-            size_t removedCount = std::distance( newEnd, pl.end() );
-            if ( removedCount > 0 )
-            {
-                logger_->debug( "Removed {} stale providers for CID: {}",
-                                removedCount,
-                                cidToString( providerIt->first ) );
-            }
-
-            pl.erase( newEnd, pl.end() );
-            if ( pl.empty() )
-            {
-                providerIt = providers_.erase( providerIt );
-            }
-            else
-            {
-                ++providerIt;
-            }
-        }
     }
 
     void Bitswap::requestBlockWithProviders( const CID &cid, BlockCallback onBlockCallback, int attemptCount )

@@ -113,6 +113,12 @@ namespace sgns::ipfs_bitswap
     private:
         void HandleResponseTimeout();
 
+        /**
+         * @mutex mutex_ — Guards callbacks_ list and responseTimer_.
+         *   Acquired in AddCallback() (under outer mutexRequestCallbacks_ in messageSent)
+         *   and HandleResponse(). HandleResponseTimeout() does NOT acquire mutex_ —
+         *   it forwards to HandleResponse which handles its own locking.
+         */
         std::mutex                       mutex_;
         std::list<BlockCallback>         callbacks_;
         boost::asio::deadline_timer      responseTimer_;
@@ -171,6 +177,16 @@ namespace sgns::ipfs_bitswap
     /**
      * /bitswap/1.0.0 protocol implementation
      * Allows getting/serving blocks from/to remote peers
+     *
+     * Concurrency model: 7 mutex domains (mutexRequestCallbacks_, mutexContentRequests_,
+     * mutexActiveStreams_, mutexBlockStore_, mutexCacheDir_, mutexDiskIndex_,
+     * mutexProviders_) + 2 atomics (maxPeerAttempts_, peerFailureThreshold_).
+     * One documented lock ordering: mutexCacheDir_ -> mutexDiskIndex_ (buildDiskIndex).
+     * One documented lock ordering: mutexRequestCallbacks_ -> mutexProviders_ (markProviderSuccess).
+     * Callbacks posted to io_context (PublishFile/PublishDirectory) or dispatched to
+     * io_context (ContentRequestContext callbacks). io_context provides strand
+     * serialization for publish and content-request processing.
+     * All locks released before async calls and filesystem I/O.
      */
     class Bitswap : public libp2p::protocol::BaseProtocol, public std::enable_shared_from_this<Bitswap>
     {
@@ -182,6 +198,16 @@ namespace sgns::ipfs_bitswap
         void initialize();
 
         libp2p::peer::Protocol getProtocolId() const override;
+        /**
+         * @brief Handle an incoming Bitswap stream from a peer.
+         *
+         * Runs on the libp2p protocol dispatch thread. The server read loop
+         * (recurring async reads for wantlist messages) also executes on
+         * libp2p I/O threads via the ProtobufMessageReadWriter callback chain.
+         *
+         * All lock acquisitions in this path occur on libp2p threads, not on
+         * the Bitswap io_context.
+         */
         void                   handle( libp2p::StreamAndProtocol stream_res ) override;
         void                   start();
 
@@ -306,7 +332,6 @@ namespace sgns::ipfs_bitswap
         libp2p::peer::PeerInfo selectBestProvider( const CID &cid );
         void                   markProviderFailure( const CID &cid, const libp2p::peer::PeerId &peerId );
         void                   markProviderSuccess( const CID &cid, const libp2p::peer::PeerId &peerId );
-        void                   cleanupStaleProviders();
         PeerProvider          *findProvider( const CID &cid, const libp2p::peer::PeerId &peerId );
 
         // Internal request methods with provider failover
@@ -323,29 +348,107 @@ namespace sgns::ipfs_bitswap
         std::shared_ptr<boost::asio::io_context> context_;
         bool                                     started_ = false;
 
+        /**
+         * @name Request Callback Synchronization
+         *
+         * @mutex mutexRequestCallbacks_ — Guards requestContexts_ map.
+         *   Lock ordering: mutexRequestCallbacks_ -> mutexProviders_ (via markProviderSuccess).
+         *   Held on: libp2p I/O thread (processReceivedBlocks, messageSent).
+         *   Callbacks NOT invoked under this lock (C-7 fix).
+         */
+        ///@{
         mutable std::mutex                                    mutexRequestCallbacks_;
         std::map<CID, std::shared_ptr<BitswapRequestContext>> requestContexts_;
+        ///@}
 
+        /**
+         * @name Content Request Synchronization
+         *
+         * @mutex mutexContentRequests_ — Guards contentRequests_ map.
+         *   Held on: caller thread and io_context (timeout handler).
+         *   NOT nested with other mutexes. Callbacks invoked under this lock (timeout path;
+         *   re-entrancy risk noted — content callback should not re-enter Bitswap's request APIs).
+         */
+        ///@{
         mutable std::mutex                                    mutexContentRequests_;
         std::map<CID, std::shared_ptr<ContentRequestContext>> contentRequests_;
+        ///@}
 
+        /**
+         * @name Active Stream Synchronization
+         *
+         * @mutex mutexActiveStreams_ — Guards activeStreams_ map.
+         *   Held on: caller thread, io_context (retry timer), libp2p callback (newStream result).
+         *   Released before all async calls (writeBitswapMessageToStream, host_.newStream).
+         *   NOT nested with other mutexes. Stream cached via shared_ptr for lifetime safety.
+         */
+        ///@{
         mutable std::mutex                                                          mutexActiveStreams_;
         std::map<libp2p::peer::PeerId, std::shared_ptr<libp2p::connection::Stream>> activeStreams_;
+        ///@}
 
+        /**
+         * @name Block Store Synchronization
+         *
+         * @mutex mutexBlockStore_ — Guards blockStore_ and publishedContent_ maps.
+         *   Held on: caller thread, libp2p thread (handleWantlistRequest), io_context (publish work).
+         *   NOT nested with any other mutex. Always released before async calls or filesystem I/O.
+         */
+        ///@{
         mutable std::mutex              mutexBlockStore_;
         std::map<CID, StoredBlock>      blockStore_;
         std::map<CID, PublishedContent> publishedContent_;
+        ///@}
 
-        // Disk persistence
+        /**
+         * @name Cache Directory Synchronization
+         *
+         * @mutex mutexCacheDir_ — Guards cacheDir_ string.
+         *   Lock ordering: mutexCacheDir_ -> mutexDiskIndex_ (via buildDiskIndex).
+         *   Held for minimum scope — value copied to local before any filesystem I/O.
+         *   Held on: caller thread, main init thread (buildDiskIndex).
+         */
+        ///@{
         std::string                cacheDir_;
         mutable std::mutex         mutexCacheDir_;
+        ///@}
+        /**
+         * @name Disk Index Synchronization
+         *
+         * @mutex mutexDiskIndex_ — Guards diskIndex_ set.
+         *   Held on: main init thread (buildDiskIndex), caller thread (persistBlock, unpersistBlock),
+         *            libp2p/consumer thread (tryLoadFromDisk, HasBlock).
+         *   NOT nested with other mutexes except via mutexCacheDir_ -> mutexDiskIndex_ in buildDiskIndex.
+         *   buildDiskIndex() clear-then-populate creates a transitory empty-index window — benign.
+         */
+        ///@{
         mutable std::mutex         mutexDiskIndex_;
         std::set<std::string>      diskIndex_;
+        ///@}
 
+        /**
+         * @name Provider Synchronization
+         *
+         * @mutex mutexProviders_ — Guards providers_ map.
+         *   Lock ordering: acquired inside mutexRequestCallbacks_ via markProviderSuccess.
+         *   Held on: caller thread, libp2p thread (markProviderSuccess).
+         *   findProvider() returns raw PeerProvider* valid only under lock.
+         *
+         * @atomic maxPeerAttempts_ — Max provider selection attempts (C-2 fix).
+         *   Written by SetMaxPeerAttempts (release ordering).
+         *   Read under mutexProviders_ in selectBestProvider (relaxed ordering sufficient).
+         *   Read without lock in requestBlockWithProviders* (acquire ordering).
+         *
+         * @atomic peerFailureThreshold_ — Failure count before marking provider unreachable (C-2 fix).
+         *   Written by SetPeerFailureThreshold (release ordering).
+         *   Read under mutexProviders_ in selectBestProvider/markProviderFailure (relaxed ordering).
+         */
+        ///@{
         mutable std::mutex                       mutexProviders_;
         std::map<CID, std::vector<PeerProvider>> providers_;
         std::atomic<size_t>                      maxPeerAttempts_{3};
         std::atomic<int>                         peerFailureThreshold_{3};
+        ///@}
 
         Logger logger_ = createLogger( "Bitswap" );
     };
