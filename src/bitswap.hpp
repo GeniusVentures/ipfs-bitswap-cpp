@@ -113,6 +113,7 @@ namespace sgns::ipfs_bitswap
     private:
         void HandleResponseTimeout();
 
+        std::mutex                       mutex_;
         std::list<BlockCallback>         callbacks_;
         boost::asio::deadline_timer      responseTimer_;
         boost::posix_time::time_duration responseTimeout_;
