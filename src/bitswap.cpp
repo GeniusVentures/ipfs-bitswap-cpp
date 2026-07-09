@@ -1478,7 +1478,7 @@ namespace sgns::ipfs_bitswap
         return diskIndex_.count( cidStr ) > 0;
     }
 
-    libp2p::outcome::result<std::string> Bitswap::GetBlock( const CID &cid ) const
+    libp2p::outcome::result<std::string> Bitswap::GetBlock( const CID &cid )
     {
         {
             std::lock_guard<std::mutex> guard( mutexBlockStore_ );
@@ -1489,7 +1489,7 @@ namespace sgns::ipfs_bitswap
             }
         }
         // Lazy-load from disk if available
-        if ( const_cast<Bitswap *>( this )->tryLoadFromDisk( cid ) )
+        if ( tryLoadFromDisk( cid ) )
         {
             std::lock_guard<std::mutex> guard( mutexBlockStore_ );
             auto                        blockIt = blockStore_.find( cid );
