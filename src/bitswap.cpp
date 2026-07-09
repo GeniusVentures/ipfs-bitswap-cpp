@@ -68,6 +68,7 @@ namespace sgns::ipfs_bitswap
 
     void BitswapRequestContext::AddCallback( BlockCallback callback )
     {
+        std::lock_guard<std::mutex> guard( mutex_ );
         responseTimer_.expires_from_now( responseTimeout_ );
         responseTimer_.async_wait( std::bind( &BitswapRequestContext::HandleResponseTimeout, this ) );
         callbacks_.emplace_back( std::move( callback ) );
@@ -75,6 +76,7 @@ namespace sgns::ipfs_bitswap
 
     void BitswapRequestContext::HandleResponse( libp2p::outcome::result<std::string> block )
     {
+        std::lock_guard<std::mutex> guard( mutex_ );
         responseTimer_.expires_at( boost::posix_time::pos_infin );
         for ( auto &callback : callbacks_ )
         {
@@ -267,19 +269,27 @@ namespace sgns::ipfs_bitswap
                 continue;
             }
 
-            std::lock_guard<std::mutex> callbacksGuard( mutexRequestCallbacks_ );
-            auto                        itContext = requestContexts_.find( cid.value() );
-            if ( itContext != requestContexts_.end() )
+            std::shared_ptr<BitswapRequestContext> ctx;
             {
-                if ( auto remotePeer = stream->remotePeerId() )
+                std::lock_guard<std::mutex> callbacksGuard( mutexRequestCallbacks_ );
+                auto                        itContext = requestContexts_.find( cid.value() );
+                if ( itContext != requestContexts_.end() )
                 {
-                    markProviderSuccess( cid.value(), remotePeer.value() );
+                    if ( auto remotePeer = stream->remotePeerId() )
+                    {
+                        markProviderSuccess( cid.value(), remotePeer.value() );
+                    }
+                    ctx = itContext->second;
+                    requestContexts_.erase( itContext );
                 }
-                itContext->second->HandleResponse( block );
+                else
+                {
+                    logger_->warn( "No request context found for received block CID: {}", cidToString( cid.value() ) );
+                }
             }
-            else
+            if ( ctx )
             {
-                logger_->warn( "No request context found for received block CID: {}", cidToString( cid.value() ) );
+                ctx->HandleResponse( block );
             }
         }
     }
@@ -356,12 +366,16 @@ namespace sgns::ipfs_bitswap
                       cid,
                       [this, ctx]( libp2p::outcome::result<std::string> blockResult )
                       {
-                          if ( !blockResult )
-                          {
-                              failContentRequest( *ctx, static_cast<BitswapError>( blockResult.error().value() ) );
-                              return;
-                          }
-                          processUnixFSBlock( ctx, ctx->rootCID, blockResult.value(), "" );
+                          boost::asio::dispatch( *context_,
+                              [this, ctx, blockResult = std::move( blockResult )]() mutable
+                              {
+                                  if ( !blockResult )
+                                  {
+                                      failContentRequest( *ctx, static_cast<BitswapError>( blockResult.error().value() ) );
+                                      return;
+                                  }
+                                  processUnixFSBlock( ctx, ctx->rootCID, blockResult.value(), "" );
+                              } );
                       } );
     }
 
@@ -378,12 +392,16 @@ namespace sgns::ipfs_bitswap
                           cid,
                           [this, ctx]( libp2p::outcome::result<std::string> blockResult )
                           {
-                              if ( !blockResult )
-                              {
-                                  failContentRequest( *ctx, static_cast<BitswapError>( blockResult.error().value() ) );
-                                  return;
-                              }
-                              processUnixFSBlock( ctx, ctx->rootCID, blockResult.value(), "" );
+                              boost::asio::dispatch( *context_,
+                                  [this, ctx, blockResult = std::move( blockResult )]() mutable
+                                  {
+                                      if ( !blockResult )
+                                      {
+                                          failContentRequest( *ctx, static_cast<BitswapError>( blockResult.error().value() ) );
+                                          return;
+                                      }
+                                      processUnixFSBlock( ctx, ctx->rootCID, blockResult.value(), "" );
+                                  } );
                           } );
         }
         catch ( const std::exception & )
@@ -944,25 +962,32 @@ namespace sgns::ipfs_bitswap
                           nextCid,
                           [this, ctx, nextCid]( libp2p::outcome::result<std::string> result )
                           {
-                              if ( !result && ctx->useProviders )
-                              {
-                                  // Fallback to provider system
-                                  ctx->processingQueue = false;
-                                  requestBlockWithProvidersFromRoot(
-                                      ctx->rootCID,
-                                      nextCid,
-                                      [this, ctx, nextCid]( libp2p::outcome::result<std::string> fallbackResult )
-                                      { handleQueuedBlockResult( ctx, nextCid, std::move( fallbackResult ) ); } );
-                                  return;
-                              }
-                              handleQueuedBlockResult( ctx, nextCid, std::move( result ) );
+                              boost::asio::dispatch( *context_,
+                                  [this, ctx, nextCid, result = std::move( result )]() mutable
+                                  {
+                                      if ( !result && ctx->useProviders )
+                                      {
+                                          ctx->processingQueue = false;
+                                          requestBlockWithProvidersFromRoot(
+                                              ctx->rootCID,
+                                              nextCid,
+                                              [this, ctx, nextCid]( libp2p::outcome::result<std::string> fallbackResult )
+                                              { handleQueuedBlockResult( ctx, nextCid, std::move( fallbackResult ) ); } );
+                                          return;
+                                      }
+                                      handleQueuedBlockResult( ctx, nextCid, std::move( result ) );
+                                  } );
                           } );
         }
         else if ( ctx->useProviders )
         {
             requestBlockWithProviders( nextCid,
                                        [this, ctx, nextCid]( libp2p::outcome::result<std::string> result )
-                                       { handleQueuedBlockResult( ctx, nextCid, std::move( result ) ); } );
+                                       {
+                                           boost::asio::dispatch( *context_,
+                                               [ctx, nextCid, result = std::move( result )]() mutable
+                                               { handleQueuedBlockResult( ctx, nextCid, std::move( result ) ); } );
+                                       } );
         }
         else
         {
