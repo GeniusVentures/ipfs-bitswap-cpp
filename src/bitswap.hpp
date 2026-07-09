@@ -234,7 +234,9 @@ namespace sgns::ipfs_bitswap
         std::map<std::string, std::vector<std::string>> GetProviderDebugInfo() const;
 
         // --- Publishing ---
+        /** @note Callback fires on Bitswap's internal io_context. Consumer callbacks must not block the io_context thread. */
         void PublishFile( const std::string &filePath, PublishCallback onPublishCallback );
+        /** @note Callback fires on Bitswap's internal io_context. Consumer callbacks must not block the io_context thread. */
         void PublishDirectory( const std::string &directoryPath, PublishCallback onPublishCallback );
         void PublishData( const std::vector<uint8_t> &data, PublishCallback onPublishCallback );
 
@@ -245,7 +247,9 @@ namespace sgns::ipfs_bitswap
         std::vector<PublishedContent>        ListPublishedContent() const;
 
         // --- Disk persistence (lazy-load) ---
+        /** @note Sets cache directory under mutex (`mutexCacheDir_`) protection. Call once before starting async operations for deterministic behavior. */
         void setCacheDir( const std::string &dir );
+        /** @note Returns a copy of the cache directory under mutex (`mutexCacheDir_`) protection. Thread-safe for concurrent calls. */
         std::string getCacheDir() const;
         void buildDiskIndex();
         void persistBlock( const CID &cid, const std::string &blockData );
