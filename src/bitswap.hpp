@@ -8,6 +8,7 @@
 #include <set>
 #include <queue>
 #include <chrono>
+#include <atomic>
 
 #include <libp2p/event/bus.hpp>
 #include <libp2p/protocol/base_protocol.hpp>
@@ -342,8 +343,8 @@ namespace sgns::ipfs_bitswap
 
         mutable std::mutex                       mutexProviders_;
         std::map<CID, std::vector<PeerProvider>> providers_;
-        size_t                                   maxPeerAttempts_      = 3;
-        int                                      peerFailureThreshold_ = 3;
+        std::atomic<size_t>                      maxPeerAttempts_{3};
+        std::atomic<int>                         peerFailureThreshold_{3};
 
         Logger logger_ = createLogger( "Bitswap" );
     };
