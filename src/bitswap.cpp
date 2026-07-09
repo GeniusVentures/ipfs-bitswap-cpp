@@ -1615,12 +1615,12 @@ namespace sgns::ipfs_bitswap
 
     void Bitswap::SetMaxPeerAttempts( size_t maxPeers )
     {
-        maxPeerAttempts_ = maxPeers;
+        maxPeerAttempts_.store( maxPeers, std::memory_order_release );
     }
 
     void Bitswap::SetPeerFailureThreshold( int threshold )
     {
-        peerFailureThreshold_ = threshold;
+        peerFailureThreshold_.store( threshold, std::memory_order_release );
     }
 
     void Bitswap::AddProviders( const CID &cid, const std::vector<libp2p::peer::PeerInfo> &peerInfos )
@@ -1677,7 +1677,7 @@ namespace sgns::ipfs_bitswap
         std::vector<std::reference_wrapper<PeerProvider>> reachableProviders;
         for ( auto &p : providerList )
         {
-            if ( p.isReachable && p.failureCount < peerFailureThreshold_ )
+            if ( p.isReachable && p.failureCount < peerFailureThreshold_.load( std::memory_order_relaxed ) )
             {
                 reachableProviders.push_back( std::ref( p ) );
             }
@@ -1734,7 +1734,7 @@ namespace sgns::ipfs_bitswap
         }
 
         p->failureCount++;
-        if ( p->failureCount >= peerFailureThreshold_ )
+        if ( p->failureCount >= peerFailureThreshold_.load( std::memory_order_relaxed ) )
         {
             p->isReachable = false;
             logger_->warn( "Marked provider {} as unreachable for CID: {} (failures: {})",
@@ -1806,9 +1806,9 @@ namespace sgns::ipfs_bitswap
 
     void Bitswap::requestBlockWithProviders( const CID &cid, BlockCallback onBlockCallback, int attemptCount )
     {
-        if ( attemptCount >= static_cast<int>( maxPeerAttempts_ ) )
+        if ( attemptCount >= static_cast<int>( maxPeerAttempts_.load( std::memory_order_acquire ) ) )
         {
-            logger_->error( "Exhausted all {} provider attempts for CID: {}", maxPeerAttempts_, cidToString( cid ) );
+            logger_->error( "Exhausted all {} provider attempts for CID: {}", maxPeerAttempts_.load( std::memory_order_acquire ), cidToString( cid ) );
             onBlockCallback( BitswapError::OUTBOUND_STREAM_FAILURE );
             return;
         }
@@ -1851,10 +1851,10 @@ namespace sgns::ipfs_bitswap
                                                      BlockCallback onBlockCallback,
                                                      int           attemptCount )
     {
-        if ( attemptCount >= static_cast<int>( maxPeerAttempts_ ) )
+        if ( attemptCount >= static_cast<int>( maxPeerAttempts_.load( std::memory_order_acquire ) ) )
         {
             logger_->error( "Exhausted all {} provider attempts for target CID: {} using root CID: {}",
-                            maxPeerAttempts_,
+                            maxPeerAttempts_.load( std::memory_order_acquire ),
                             cidToString( targetCid ),
                             cidToString( rootCid ) );
             onBlockCallback( BitswapError::OUTBOUND_STREAM_FAILURE );
