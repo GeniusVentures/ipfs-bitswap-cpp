@@ -988,9 +988,9 @@ namespace sgns::ipfs_bitswap
             requestBlockWithProviders( nextCid,
                                        [this, ctx, nextCid]( libp2p::outcome::result<std::string> result )
                                        {
-                                           boost::asio::dispatch( *context_,
-                                               [ctx, nextCid, result = std::move( result )]() mutable
-                                               { handleQueuedBlockResult( ctx, nextCid, std::move( result ) ); } );
+                                       boost::asio::dispatch( *context_,
+                                           [this, ctx, nextCid, result = std::move( result )]() mutable
+                                           { handleQueuedBlockResult( ctx, nextCid, std::move( result ) ); } );
                                        } );
         }
         else
