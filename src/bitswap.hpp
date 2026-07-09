@@ -336,6 +336,7 @@ namespace sgns::ipfs_bitswap
 
         // Disk persistence
         std::string                cacheDir_;
+        mutable std::mutex         mutexCacheDir_;
         mutable std::mutex         mutexDiskIndex_;
         std::set<std::string>      diskIndex_;
 

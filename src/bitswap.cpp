@@ -1907,6 +1907,7 @@ namespace sgns::ipfs_bitswap
 
     void Bitswap::setCacheDir( const std::string &dir )
     {
+        std::lock_guard<std::mutex> guard( mutexCacheDir_ );
         cacheDir_ = dir;
         if ( !dir.empty() )
         {
@@ -1916,20 +1917,27 @@ namespace sgns::ipfs_bitswap
 
     std::string Bitswap::getCacheDir() const
     {
+        std::lock_guard<std::mutex> guard( mutexCacheDir_ );
         return cacheDir_;
     }
 
     void Bitswap::buildDiskIndex()
     {
-        if ( cacheDir_.empty() )
+        std::string dirCopy;
+        {
+            std::lock_guard<std::mutex> guard( mutexCacheDir_ );
+            dirCopy = cacheDir_;
+        }
+
+        if ( dirCopy.empty() )
         {
             return;
         }
 
         namespace fs = std::filesystem;
-        if ( !fs::exists( cacheDir_ ) || !fs::is_directory( cacheDir_ ) )
+        if ( !fs::exists( dirCopy ) || !fs::is_directory( dirCopy ) )
         {
-            logger_->debug( "Bitswap cache directory does not exist, skipping disk index build: {}", cacheDir_ );
+            logger_->debug( "Bitswap cache directory does not exist, skipping disk index build: {}", dirCopy );
             return;
         }
 
@@ -1939,7 +1947,7 @@ namespace sgns::ipfs_bitswap
         }
 
         size_t count = 0;
-        for ( const auto &entry : fs::directory_iterator( cacheDir_ ) )
+        for ( const auto &entry : fs::directory_iterator( dirCopy ) )
         {
             if ( entry.is_regular_file() )
             {
@@ -1952,17 +1960,24 @@ namespace sgns::ipfs_bitswap
             }
         }
 
-        logger_->info( "Built disk index from {}: {} CIDs available", cacheDir_, count );
+        logger_->info( "Built disk index from {}: {} CIDs available", dirCopy, count );
     }
 
     std::string Bitswap::cidToFilePath( const std::string &cidStr ) const
     {
+        std::lock_guard<std::mutex> guard( mutexCacheDir_ );
         return cacheDir_ + "/" + cidStr;
     }
 
     void Bitswap::persistBlock( const CID &cid, const std::string &blockData )
     {
-        if ( cacheDir_.empty() )
+        std::string dirCopy;
+        {
+            std::lock_guard<std::mutex> guard( mutexCacheDir_ );
+            dirCopy = cacheDir_;
+        }
+
+        if ( dirCopy.empty() )
         {
             return;
         }
@@ -1982,12 +1997,12 @@ namespace sgns::ipfs_bitswap
         // Ensure cache directory exists
         namespace fs = std::filesystem;
         std::error_code ec;
-        if ( !fs::exists( cacheDir_, ec ) )
+        if ( !fs::exists( dirCopy, ec ) )
         {
-            fs::create_directories( cacheDir_, ec );
+            fs::create_directories( dirCopy, ec );
             if ( ec )
             {
-                logger_->warn( "Failed to create cache directory {}: {}", cacheDir_, ec.message() );
+                logger_->warn( "Failed to create cache directory {}: {}", dirCopy, ec.message() );
                 return;
             }
         }
@@ -2008,7 +2023,13 @@ namespace sgns::ipfs_bitswap
 
     void Bitswap::unpersistBlock( const CID &cid )
     {
-        if ( cacheDir_.empty() )
+        std::string dirCopy;
+        {
+            std::lock_guard<std::mutex> guard( mutexCacheDir_ );
+            dirCopy = cacheDir_;
+        }
+
+        if ( dirCopy.empty() )
         {
             return;
         }
@@ -2042,7 +2063,13 @@ namespace sgns::ipfs_bitswap
 
     bool Bitswap::tryLoadFromDisk( const CID &cid )
     {
-        if ( cacheDir_.empty() )
+        std::string dirCopy;
+        {
+            std::lock_guard<std::mutex> guard( mutexCacheDir_ );
+            dirCopy = cacheDir_;
+        }
+
+        if ( dirCopy.empty() )
         {
             return false;
         }
