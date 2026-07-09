@@ -12,7 +12,6 @@
 #include <string>
 #include <fstream>
 #include <filesystem>
-#include <thread>
 #include <algorithm>
 #include <functional>
 
@@ -1355,10 +1354,11 @@ namespace sgns::ipfs_bitswap
     {
         logger_->debug( "Publishing file: {}", filePath );
 
-        std::thread(
-            [this, filePath, callback = std::move( onPublishCallback )]()
+        auto self = shared_from_this();
+        boost::asio::post( *context_,
+            [self, filePath, callback = std::move( onPublishCallback )]()
             {
-                CID rootCID = encodeAndStoreFile( filePath );
+                CID rootCID = self->encodeAndStoreFile( filePath );
                 if ( rootCID.content_address.toBuffer().empty() )
                 {
                     callback( BitswapError::ENCODING_FAILURE );
@@ -1366,36 +1366,36 @@ namespace sgns::ipfs_bitswap
                 }
 
                 {
-                    std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+                    std::lock_guard<std::mutex> guard( self->mutexBlockStore_ );
                     PublishedContent            content{ filePath,
                                                          rootCID,
                                                          {},
                                                          UnixFSContent::SINGLE_FILE,
                                                          0,
                                                          std::chrono::steady_clock::now() };
-                    auto                        blockIt = blockStore_.find( rootCID );
-                    if ( blockIt != blockStore_.end() )
+                    auto                        blockIt = self->blockStore_.find( rootCID );
+                    if ( blockIt != self->blockStore_.end() )
                     {
                         content.blocks.emplace( rootCID, blockIt->second );
                         content.totalSize = blockIt->second.size;
                     }
-                    publishedContent_.emplace( rootCID, std::move( content ) );
+                    self->publishedContent_.emplace( rootCID, std::move( content ) );
                 }
 
-                logger_->info( "Successfully published file: {} with CID: {}", filePath, cidToString( rootCID ) );
+                self->logger_->info( "Successfully published file: {} with CID: {}", filePath, cidToString( rootCID ) );
                 callback( rootCID );
-            } )
-            .detach();
+            } );
     }
 
     void Bitswap::PublishDirectory( const std::string &directoryPath, PublishCallback onPublishCallback )
     {
         logger_->debug( "Publishing directory: {}", directoryPath );
 
-        std::thread(
-            [this, directoryPath, callback = std::move( onPublishCallback )]()
+        auto self = shared_from_this();
+        boost::asio::post( *context_,
+            [self, directoryPath, callback = std::move( onPublishCallback )]()
             {
-                CID rootCID = encodeAndStoreDirectory( directoryPath );
+                CID rootCID = self->encodeAndStoreDirectory( directoryPath );
                 if ( rootCID.content_address.toBuffer().empty() )
                 {
                     callback( BitswapError::ENCODING_FAILURE );
@@ -1403,7 +1403,7 @@ namespace sgns::ipfs_bitswap
                 }
 
                 {
-                    std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+                    std::lock_guard<std::mutex> guard( self->mutexBlockStore_ );
                     PublishedContent            content{ directoryPath,
                                                          rootCID,
                                                          {},
@@ -1411,7 +1411,7 @@ namespace sgns::ipfs_bitswap
                                                          0,
                                                          std::chrono::steady_clock::now() };
                     size_t                      totalSize = 0;
-                    for ( const auto &[cid, block] : blockStore_ )
+                    for ( const auto &[cid, block] : self->blockStore_ )
                     {
                         if ( block.filePath && block.filePath->find( directoryPath ) == 0 )
                         {
@@ -1420,15 +1420,14 @@ namespace sgns::ipfs_bitswap
                         }
                     }
                     content.totalSize = totalSize;
-                    publishedContent_.emplace( rootCID, std::move( content ) );
+                    self->publishedContent_.emplace( rootCID, std::move( content ) );
                 }
 
-                logger_->info( "Successfully published directory: {} with CID: {}",
+                self->logger_->info( "Successfully published directory: {} with CID: {}",
                                directoryPath,
                                cidToString( rootCID ) );
                 callback( rootCID );
-            } )
-            .detach();
+            } );
     }
 
     void Bitswap::PublishData( const std::vector<uint8_t> &data, PublishCallback onPublishCallback )
