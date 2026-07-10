@@ -571,13 +571,24 @@ namespace sgns::ipfs_bitswap
                 {
                     return;
                 }
-                std::lock_guard<std::mutex> guard( mutexContentRequests_ );
-                auto                        it = contentRequests_.find( cid );
-                if ( it != contentRequests_.end() && !it->second->timedOut )
+
+                // Erase context from map under lock, invoke callback outside lock
+                // to prevent re-entrancy deadlock (same pattern as C-7 fix in
+                // processReceivedBlocks).
+                ContentCallback callback;
                 {
-                    it->second->timedOut = true;
-                    it->second->callback( BitswapError::CONTENT_REQUEST_TIMEOUT );
-                    contentRequests_.erase( it );
+                    std::lock_guard<std::mutex> guard( mutexContentRequests_ );
+                    auto                        it = contentRequests_.find( cid );
+                    if ( it != contentRequests_.end() && !it->second->timedOut )
+                    {
+                        it->second->timedOut = true;
+                        callback             = std::move( it->second->callback );
+                        contentRequests_.erase( it );
+                    }
+                }
+                if ( callback )
+                {
+                    callback( BitswapError::CONTENT_REQUEST_TIMEOUT );
                 }
             } );
 
@@ -590,7 +601,13 @@ namespace sgns::ipfs_bitswap
         {
             return;
         }
+
+        // Mark timed-out before invoking callback so that the timeout handler
+        // (which also runs on io_context via C-5 dispatch serialization) sees
+        // the flag and bails — prevents double-callback.
+        ctx.timedOut = true;
         ctx.callback( error );
+
         std::lock_guard<std::mutex> guard( mutexContentRequests_ );
         contentRequests_.erase( ctx.rootCID );
     }
@@ -1049,7 +1066,7 @@ namespace sgns::ipfs_bitswap
         if ( !file )
         {
             logger_->error( "Failed to open file: {}", filePath );
-            throw std::runtime_error( "Failed to open file: " + filePath );
+            throw std::runtime_error( "File not found: " + filePath );
         }
 
         file.seekg( 0, std::ios::end );
