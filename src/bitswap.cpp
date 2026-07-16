@@ -1910,7 +1910,7 @@ namespace sgns::ipfs_bitswap
         cacheDir_ = dir;
         if ( !dir.empty() )
         {
-            logger_->info( "Bitswap disk cache directory set to: {}", dir );
+            logger_->trace( "Bitswap disk cache directory set to: {}", dir );
         }
     }
 
