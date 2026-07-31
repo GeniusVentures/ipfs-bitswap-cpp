@@ -1,89 +1,62 @@
 #include "merkledag_decoder.hpp"
-#include "merkledag_decoder.hpp"
-#include <proto/merkledag.pb.h>
+
 #include <libp2p/multi/content_identifier_codec.hpp>
+#include <proto/merkledag.pb.h>
 
-namespace sgns::ipfs_bitswap
+OUTCOME_CPP_DEFINE_CATEGORY( sgns::ipfs_bitswap::merkledag, DecodeError, e )
 {
-
-    bool MerkledagDecoder::decode( const std::vector<uint8_t> &data )
+    using sgns::ipfs_bitswap::merkledag::DecodeError;
+    switch ( e )
     {
-        valid_ = node_.ParseFromArray( data.data(), static_cast<int>( data.size() ) );
-        return valid_;
+        case DecodeError::INVALID_PROTOBUF:
+            return "invalid DAG-PB protobuf";
+        case DecodeError::MISSING_LINK_CID:
+            return "DAG-PB link is missing its CID";
+        case DecodeError::INVALID_LINK_CID:
+            return "DAG-PB link contains an invalid CID";
     }
+    return "unknown DAG-PB decode error";
+}
 
-    bool MerkledagDecoder::decode( const std::string &data )
+namespace sgns::ipfs_bitswap::merkledag
+{
+    libp2p::outcome::result<Node> Decode( const std::string &data )
     {
-        valid_ = node_.ParseFromString( data );
-        return valid_;
-    }
-
-    std::optional<std::vector<uint8_t>> MerkledagDecoder::getData() const
-    {
-        if ( !valid_ || !node_.has_data() )
+        ::merkledag::pb::PBNode pbNode;
+        if ( !pbNode.ParseFromString( data ) )
         {
-            return std::nullopt;
+            return DecodeError::INVALID_PROTOBUF;
         }
 
-        const std::string &dataStr = node_.data();
-        return std::vector<uint8_t>( dataStr.begin(), dataStr.end() );
-    }
-
-    std::vector<DecodedLink> MerkledagDecoder::getLinks() const
-    {
-        std::vector<DecodedLink> links;
-        if ( !valid_ )
+        Node node;
+        if ( pbNode.has_data() )
         {
-            return links;
+            const auto &pbData = pbNode.data();
+            node.data.emplace( pbData.begin(), pbData.end() );
         }
 
-        for ( const auto &pbLink : node_.links() )
+        node.links.reserve( pbNode.links_size() );
+        for ( const auto &pbLink : pbNode.links() )
         {
-            // Decode the CID from the hash field
-            const std::string &hashStr   = pbLink.hash();
-            auto               cidResult = libp2p::multi::ContentIdentifierCodec::decode(
-                gsl::span( reinterpret_cast<const uint8_t *>( hashStr.data() ), hashStr.size() ) );
-            if ( cidResult.has_value() )
+            if ( !pbLink.has_hash() )
             {
-                links.emplace_back( pbLink.name(), std::move( cidResult.value() ), pbLink.tsize() );
+                return DecodeError::MISSING_LINK_CID;
             }
-        }
 
-        return links;
-    }
-
-    std::optional<DecodedLink> MerkledagDecoder::getLink( const std::string &name ) const
-    {
-        if ( !valid_ )
-        {
-            return std::nullopt;
-        }
-
-        for ( const auto &pbLink : node_.links() )
-        {
-            if ( pbLink.name() == name )
+            const auto &hash = pbLink.hash();
+            auto        cid  = libp2p::multi::ContentIdentifierCodec::decode(
+                gsl::span( reinterpret_cast<const uint8_t *>( hash.data() ), hash.size() ) );
+            if ( !cid )
             {
-                const std::string &hashStr   = pbLink.hash();
-                auto               cidResult = libp2p::multi::ContentIdentifierCodec::decode(
-                    gsl::span( reinterpret_cast<const uint8_t *>( hashStr.data() ), hashStr.size() ) );
-                if ( cidResult.has_value() )
-                {
-                    return DecodedLink( pbLink.name(), std::move( cidResult.value() ), pbLink.tsize() );
-                }
+                return DecodeError::INVALID_LINK_CID;
             }
+
+            node.links.push_back( DecodedLink{
+                pbLink.has_name() ? std::make_optional( pbLink.name() ) : std::nullopt,
+                std::move( cid.value() ),
+                pbLink.has_tsize() ? std::make_optional( pbLink.tsize() ) : std::nullopt } );
         }
 
-        return std::nullopt;
+        return node;
     }
-
-    bool MerkledagDecoder::isValid() const
-    {
-        return valid_;
-    }
-
-    const merkledag::pb::PBNode &MerkledagDecoder::getNode() const
-    {
-        return node_;
-    }
-
 }

@@ -5,7 +5,6 @@
 #include "merkledag_decoder.hpp"
 
 #include <proto/unixfs.pb.h>
-#include <proto/merkledag.pb.h>
 
 #include <algorithm>
 #include <memory>
@@ -634,15 +633,16 @@ namespace sgns::ipfs_bitswap
             return;
         }
 
-        MerkledagDecoder decoder;
-        if ( !decoder.decode( blockData ) )
+        auto nodeResult = merkledag::Decode( blockData );
+        if ( !nodeResult )
         {
             failContentRequest( *ctx, BitswapError::IPLD_DECODE_FAILURE );
             return;
         }
+        auto node = std::move( nodeResult.value() );
 
         // Queue any new links
-        for ( const auto &link : decoder.getLinks() )
+        for ( const auto &link : node.links )
         {
             if ( ctx->completedCIDs.count( link.cid ) == 0 )
             {
@@ -654,8 +654,8 @@ namespace sgns::ipfs_bitswap
 
         // Parse UnixFS data
         unixfs_pb::Data unixfsData;
-        auto            dataOpt = decoder.getData();
-        if ( !dataOpt || !unixfsData.ParseFromArray( dataOpt->data(), static_cast<int>( dataOpt->size() ) ) )
+        if ( !node.data ||
+             !unixfsData.ParseFromArray( node.data->data(), static_cast<int>( node.data->size() ) ) )
         {
             failContentRequest( *ctx, BitswapError::INVALID_UNIXFS_DATA );
             return;
@@ -664,10 +664,10 @@ namespace sgns::ipfs_bitswap
         switch ( unixfsData.type() )
         {
             case unixfs_pb::Data::Directory:
-                handleDirectoryBlock( ctx, decoder, path );
+                handleDirectoryBlock( ctx, node.links, path );
                 break;
             default:
-                handleFileBlock( ctx, cid, unixfsData, decoder, path );
+                handleFileBlock( ctx, cid, unixfsData, node.links, path );
                 break;
         }
 
@@ -677,11 +677,9 @@ namespace sgns::ipfs_bitswap
     void Bitswap::handleFileBlock( std::shared_ptr<ContentRequestContext> ctx,
                                    const CID                             &cid,
                                    const unixfs_pb::Data                 &unixfsData,
-                                   const MerkledagDecoder                &decoder,
+                                   const std::vector<merkledag::DecodedLink> &links,
                                    const std::string                     &path )
     {
-        auto links = decoder.getLinks();
-
         std::string filePath = path;
         if ( filePath.empty() )
         {
@@ -784,25 +782,26 @@ namespace sgns::ipfs_bitswap
 
         auto &fileProgress = ctx->filesInProgress[parentCid];
 
-        MerkledagDecoder decoder;
-        if ( !decoder.decode( chunkData ) )
+        auto nodeResult = merkledag::Decode( chunkData );
+        if ( !nodeResult )
         {
             logger_->error( "Failed to decode IPLD chunk for file: {}", fileProgress.path );
             return;
         }
+        auto node = std::move( nodeResult.value() );
 
         std::vector<char> chunkContent;
         unixfs_pb::Data   unixfsData;
-        auto              dataOpt = decoder.getData();
 
-        if ( dataOpt && unixfsData.ParseFromArray( dataOpt->data(), static_cast<int>( dataOpt->size() ) ) &&
+        if ( node.data &&
+             unixfsData.ParseFromArray( node.data->data(), static_cast<int>( node.data->size() ) ) &&
              unixfsData.has_data() )
         {
             chunkContent = std::vector<char>( unixfsData.data().begin(), unixfsData.data().end() );
         }
-        else if ( dataOpt )
+        else if ( node.data )
         {
-            chunkContent = std::vector<char>( dataOpt->begin(), dataOpt->end() );
+            chunkContent = std::vector<char>( node.data->begin(), node.data->end() );
         }
 
         fileProgress.chunks[chunkIndex] = ContentRequestContext::FileChunk{ std::move( chunkContent ),
@@ -883,18 +882,18 @@ namespace sgns::ipfs_bitswap
     }
 
     void Bitswap::handleDirectoryBlock( std::shared_ptr<ContentRequestContext> ctx,
-                                        const MerkledagDecoder                &decoder,
+                                        const std::vector<merkledag::DecodedLink> &links,
                                         const std::string                     &basePath )
     {
-        for ( const auto &link : decoder.getLinks() )
+        for ( const auto &link : links )
         {
-            if ( link.name.empty() )
+            if ( !link.name || link.name->empty() )
             {
                 logger_->warn( "Directory entry has empty name, skipping" );
                 continue;
             }
 
-            std::string childPath = basePath.empty() ? link.name : basePath + "/" + link.name;
+            std::string childPath = basePath.empty() ? *link.name : basePath + "/" + *link.name;
 
             if ( ctx->completedCIDs.count( link.cid ) != 0 )
             {
@@ -1128,7 +1127,7 @@ namespace sgns::ipfs_bitswap
         }
 
         // Build links with empty names (Kubo convention for chunk links)
-        std::vector<MerkledagLink> merkledagLinks;
+        std::vector<merkledag::Link> merkledagLinks;
         merkledagLinks.reserve( chunkCIDs.size() );
         for ( const auto &cid : chunkCIDs )
         {
@@ -1138,7 +1137,7 @@ namespace sgns::ipfs_bitswap
                 continue;
             }
 
-            MerkledagLink link;
+            merkledag::Link link;
             link.name = "";
             link.cid  = std::move( cidResult.value() );
             {
@@ -1215,7 +1214,7 @@ namespace sgns::ipfs_bitswap
         }
 
         // Build directory links with contentSize for tsize
-        std::vector<MerkledagLink> merkledagLinks;
+        std::vector<merkledag::Link> merkledagLinks;
         size_t                     totalDirectoryContentSize = 0;
         {
             std::lock_guard<std::mutex> guard( mutexBlockStore_ );
@@ -1227,7 +1226,7 @@ namespace sgns::ipfs_bitswap
                     continue;
                 }
 
-                MerkledagLink link;
+                merkledag::Link link;
                 link.name = name;
                 link.cid  = std::move( cidResult.value() );
 
@@ -1285,9 +1284,10 @@ namespace sgns::ipfs_bitswap
         return encodeAndStoreMerkledagNode( serialized, {} );
     }
 
-    CID Bitswap::encodeAndStoreMerkledagNode( const std::string &unixfsData, const std::vector<MerkledagLink> &links )
+    CID Bitswap::encodeAndStoreMerkledagNode( const std::string                 &unixfsData,
+                                              const std::vector<merkledag::Link> &links )
     {
-        std::vector<uint8_t> encodedNode = MerkledagEncoder::encode( unixfsData, links );
+        std::vector<uint8_t> encodedNode = merkledag::Encode( unixfsData, links );
 
         auto cidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0( encodedNode.data(), encodedNode.size() );
         if ( cidBytes.empty() )
@@ -1309,10 +1309,10 @@ namespace sgns::ipfs_bitswap
     }
 
     CID Bitswap::encodeAndStoreMerkledagNode( const std::string                &unixfsData,
-                                              const std::vector<MerkledagLink> &links,
+                                              const std::vector<merkledag::Link> &links,
                                               size_t                            contentSize )
     {
-        std::vector<uint8_t> encodedNode = MerkledagEncoder::encode( unixfsData, links );
+        std::vector<uint8_t> encodedNode = merkledag::Encode( unixfsData, links );
 
         auto cidBytes = libp2p::multi::ContentIdentifierCodec::encodeCIDV0( encodedNode.data(), encodedNode.size() );
         if ( cidBytes.empty() )

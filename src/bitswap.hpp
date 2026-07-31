@@ -23,8 +23,10 @@
 
 namespace sgns::ipfs_bitswap
 {
-    // Forward declarations
-    class MerkledagDecoder;
+    namespace merkledag
+    {
+        struct DecodedLink;
+    }
 
     using CID           = libp2p::multi::ContentIdentifier;
     using BlockCallback = std::function<void( libp2p::outcome::result<std::string> )>;
@@ -278,7 +280,7 @@ namespace sgns::ipfs_bitswap
         void          handleFileBlock( std::shared_ptr<ContentRequestContext> ctx,
                                        const CID                             &cid,
                                        const unixfs_pb::Data                 &unixfsData,
-                                       const MerkledagDecoder                &decoder,
+                                       const std::vector<merkledag::DecodedLink> &links,
                                        const std::string                     &path = "" );
         void          handleFileChunk( std::shared_ptr<ContentRequestContext> ctx,
                                        const CID                             &chunkCid,
@@ -289,7 +291,7 @@ namespace sgns::ipfs_bitswap
                                             const CID                                   &fileCid,
                                             const ContentRequestContext::FileInProgress &fileProgress );
         void          handleDirectoryBlock( std::shared_ptr<ContentRequestContext> ctx,
-                                            const MerkledagDecoder                &decoder,
+                                            const std::vector<merkledag::DecodedLink> &links,
                                             const std::string                     &basePath = "" );
         void          checkContentRequestComplete( std::shared_ptr<ContentRequestContext> ctx );
         UnixFSContent assembleContent( std::shared_ptr<ContentRequestContext> ctx );
@@ -314,9 +316,10 @@ namespace sgns::ipfs_bitswap
                                 unixfs_pb::Data::DataType   type = unixfs_pb::Data::Raw );
 
         // IPLD node creation - unified helper
-        CID encodeAndStoreMerkledagNode( const std::string &unixfsData, const std::vector<MerkledagLink> &links );
+        CID encodeAndStoreMerkledagNode( const std::string &unixfsData,
+                                         const std::vector<merkledag::Link> &links );
         CID encodeAndStoreMerkledagNode( const std::string                &unixfsData,
-                                         const std::vector<MerkledagLink> &links,
+                                         const std::vector<merkledag::Link> &links,
                                          size_t                            contentSize );
 
         void storeBlock( const CID         &cid,

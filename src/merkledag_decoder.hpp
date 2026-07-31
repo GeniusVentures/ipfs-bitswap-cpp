@@ -1,77 +1,41 @@
 #pragma once
 
-#include <utility>
-#include <vector>
-#include <string>
+#include <cstdint>
 #include <optional>
-#include <libp2p/multi/content_identifier.hpp>
-#include <proto/merkledag.pb.h>
+#include <string>
+#include <vector>
 
-namespace sgns::ipfs_bitswap
+#include <libp2p/multi/content_identifier.hpp>
+#include <libp2p/outcome/outcome.hpp>
+
+namespace sgns::ipfs_bitswap::merkledag
 {
+    enum class DecodeError : uint8_t
+    {
+        INVALID_PROTOBUF = 1,
+        MISSING_LINK_CID,
+        INVALID_LINK_CID
+    };
 
     struct DecodedLink
     {
-        std::string                      name;
+        std::optional<std::string>       name;
         libp2p::multi::ContentIdentifier cid;
-        uint64_t                         size;
-
-        DecodedLink( std::string n, libp2p::multi::ContentIdentifier c, uint64_t s ) :
-            name(std::move( n )), cid(std::move( c )), size( s )
-        {
-        }
+        std::optional<uint64_t>          tsize;
     };
 
-    class MerkledagDecoder
+    struct Node
     {
-    public:
-        /**
-         * Decode a MerkleDAG node from raw bytes
-         * @param data - raw protobuf-encoded MerkleDAG node data
-         * @return true if decoding succeeded
-         */
-        bool decode( const std::vector<uint8_t> &data );
-
-        /**
-         * Decode a MerkleDAG node from string
-         * @param data - raw protobuf-encoded MerkleDAG node data
-         * @return true if decoding succeeded
-         */
-        bool decode( const std::string &data );
-
-        /**
-         * Get the data field from the decoded node
-         * @return optional data field (UnixFS data)
-         */
-        std::optional<std::vector<uint8_t>> getData() const;
-
-        /**
-         * Get all links from the decoded node
-         * @return vector of decoded links
-         */
-        std::vector<DecodedLink> getLinks() const;
-
-        /**
-         * Get a specific link by name
-         * @param name - link name to search for
-         * @return optional decoded link
-         */
-        std::optional<DecodedLink> getLink( const std::string &name ) const;
-
-        /**
-         * Check if decoding was successful
-         * @return true if node was successfully decoded
-         */
-        bool isValid() const;
-
-        /**
-         * Get the raw protobuf node (for debugging)
-         * @return reference to decoded protobuf node
-         */
-        const merkledag::pb::PBNode &getNode() const;
-
-    private:
-        merkledag::pb::PBNode node_;
-        bool                  valid_ = false;
+        std::optional<std::vector<uint8_t>> data;
+        std::vector<DecodedLink>            links;
     };
+
+    /**
+     * Decode a DAG-PB node and all of its link CIDs.
+     * @param data Raw protobuf-encoded DAG-PB node data.
+     * @return A completely decoded node or an error.
+     */
+    libp2p::outcome::result<Node> Decode( const std::string &data );
 }
+
+OUTCOME_HPP_DECLARE_ERROR_2( sgns::ipfs_bitswap::merkledag, DecodeError );
