@@ -101,7 +101,8 @@ namespace sgns::ipfs_bitswap
         CONTENT_REQUEST_TIMEOUT,
         FILE_NOT_FOUND,
         ENCODING_FAILURE,
-        BLOCK_NOT_FOUND
+        BLOCK_NOT_FOUND,
+        NO_PROVIDERS_AVAILABLE
     };
 
     class BitswapRequestContext

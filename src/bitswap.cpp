@@ -42,6 +42,8 @@ OUTCOME_CPP_DEFINE_CATEGORY( sgns::ipfs_bitswap, BitswapError, e )
             return "failed to encode content";
         case BitswapError::BLOCK_NOT_FOUND:
             return "block not found in local store";
+        case BitswapError::NO_PROVIDERS_AVAILABLE:
+            return "no providers available for CID";
     }
     return "unknown bitswap error";
 }
@@ -407,10 +409,10 @@ namespace sgns::ipfs_bitswap
                                   } );
                           } );
         }
-        catch ( const std::exception & )
+        catch ( const std::exception &e )
         {
-            logger_->error( "No providers available for root CID: {}", cidToString( cid ) );
-            failContentRequest( *ctx, BitswapError::OUTBOUND_STREAM_FAILURE );
+            logger_->error( "No providers available for root CID: {}: {}", cidToString( cid ), e.what() );
+            failContentRequest( *ctx, BitswapError::NO_PROVIDERS_AVAILABLE );
         }
     }
 
@@ -1849,10 +1851,13 @@ namespace sgns::ipfs_bitswap
                               }
                           } );
         }
-        catch ( const std::exception & )
+        catch ( const std::exception &e )
         {
-            logger_->error( "No providers available for CID: {} (attempt {})", cidToString( cid ), attemptCount + 1 );
-            onBlockCallback( BitswapError::OUTBOUND_STREAM_FAILURE );
+            logger_->error( "No providers available for CID: {} (attempt {}): {}",
+                            cidToString( cid ),
+                            attemptCount + 1,
+                            e.what() );
+            onBlockCallback( BitswapError::NO_PROVIDERS_AVAILABLE );
         }
     }
 
@@ -1901,13 +1906,14 @@ namespace sgns::ipfs_bitswap
                               }
                           } );
         }
-        catch ( const std::exception & )
+        catch ( const std::exception &e )
         {
-            logger_->error( "No providers available for root CID: {} when requesting target CID: {} (attempt {})",
+            logger_->error( "No providers available for root CID: {} when requesting target CID: {} (attempt {}): {}",
                             cidToString( rootCid ),
                             cidToString( targetCid ),
-                            attemptCount + 1 );
-            onBlockCallback( BitswapError::OUTBOUND_STREAM_FAILURE );
+                            attemptCount + 1,
+                            e.what() );
+            onBlockCallback( BitswapError::NO_PROVIDERS_AVAILABLE );
         }
     }
 
