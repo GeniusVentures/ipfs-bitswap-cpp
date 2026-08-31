@@ -71,7 +71,14 @@ namespace sgns::ipfs_bitswap
     {
         std::lock_guard<std::mutex> guard( mutex_ );
         responseTimer_.expires_from_now( responseTimeout_ );
-        responseTimer_.async_wait( std::bind( &BitswapRequestContext::HandleResponseTimeout, this ) );
+        // Capture shared_from_this so the armed timer keeps the context
+        // alive until it fires — a raw `this` capture dangles once the last
+        // external shared_ptr is released (requestContexts_.erase) while the
+        // timer is still pending, and the later handler runs on freed memory.
+        responseTimer_.async_wait(
+            [self = shared_from_this()]( const boost::system::error_code & ) {
+                self->HandleResponseTimeout();
+            } );
         callbacks_.emplace_back( std::move( callback ) );
     }
 

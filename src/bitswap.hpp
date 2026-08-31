@@ -105,7 +105,7 @@ namespace sgns::ipfs_bitswap
         NO_PROVIDERS_AVAILABLE
     };
 
-    class BitswapRequestContext
+    class BitswapRequestContext : public std::enable_shared_from_this<BitswapRequestContext>
     {
     public:
         BitswapRequestContext( boost::asio::io_context &context );
