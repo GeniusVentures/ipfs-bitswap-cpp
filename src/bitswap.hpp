@@ -336,6 +336,10 @@ namespace sgns::ipfs_bitswap
         bool tryLoadFromDisk( const CID &cid );
         std::string cidToFilePath( const std::string &cidStr ) const;
 
+        // Local-storage block read (memory then lazy disk): never dials;
+        // nullopt-equivalent failure tells callers to use the network path.
+        libp2p::outcome::result<std::string> getLocalBlock( const CID &cid );
+
         // Provider management helpers
         libp2p::peer::PeerInfo selectBestProvider( const CID &cid );
         void                   markProviderFailure( const CID &cid, const libp2p::peer::PeerId &peerId );

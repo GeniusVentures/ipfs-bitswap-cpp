@@ -395,6 +395,32 @@ namespace sgns::ipfs_bitswap
     {
         auto ctx = setupContentRequest( cid, std::move( onContentCallback ), true );
 
+        // Local-first fast path (bring-up fix, single-node transport): when
+        // this instance already holds the ROOT block (blockStore_ or the disk
+        // index), walk the dag ENTIRELY from local storage instead of opening
+        // a bitswap stream to a provider — for a self-provider (the only
+        // peer in a single-node grid) the outbound self-dial is unreliable
+        // for large chunked content ("failed to create an outbound stream"
+        // on ~277MB multi-chunk files) and the network round-trip is pure
+        // overhead when every block is local. processUnixFSBlock re-enters
+        // through processRequestQueue for chunks; the queue's peer branch
+        // hits the same local-first guard in RequestBlock-local below via
+        // getLocalBlock().
+        if ( auto localRoot = getLocalBlock( cid ) )
+        {
+            logger_->error( "[LF-DIAG] root hit local store: {}", cidToString( cid ) );
+            boost::asio::dispatch( *context_,
+                [this, ctx, block = std::move( localRoot.value() )]() mutable
+                {
+                    processUnixFSBlock( ctx, ctx->rootCID, std::move( block ), "" );
+                } );
+            return;
+        }
+        logger_->error( "[LF-DIAG] root MISS local store: {} (memBlocks={} diskIdx={})",
+                        cidToString( cid ),
+                        [&] { std::lock_guard<std::mutex> g( mutexBlockStore_ ); return blockStore_.size(); }(),
+                        [&] { std::lock_guard<std::mutex> g( mutexDiskIndex_ ); return diskIndex_.size(); }() );
+
         try
         {
             auto selectedPeer = selectBestProvider( cid );
@@ -650,6 +676,12 @@ namespace sgns::ipfs_bitswap
         }
         auto node = std::move( nodeResult.value() );
 
+        logger_->debug( "[LF] processUnixFSBlock cid={} links={} type={} isKnownChunk={}",
+                        cidToString( cid ),
+                        node.links.size(),
+                        static_cast<int>( 0 ),
+                        ctx->chunkToCidIndex.count( cid ) > 0 );
+
         // Queue any new links
         for ( const auto &link : node.links )
         {
@@ -872,6 +904,10 @@ namespace sgns::ipfs_bitswap
                        completeFile.content.size(),
                        fileProgress.chunks.size(),
                        fileProgress.expectedChunks );
+        for ( const auto &[index, chunk] : fileProgress.chunks )
+        {
+            logger_->debug( "[LF] chunk idx {} size {}", index, chunk.data.size() );
+        }
 
         ctx->collectedFiles.push_back( std::move( completeFile ) );
         ctx->filesInProgress.erase( fileCid );
@@ -984,6 +1020,21 @@ namespace sgns::ipfs_bitswap
         ctx->requestQueue.pop();
 
         logger_->debug( "Processing queued request for CID: {}", cidToString( nextCid ) );
+
+        // Local-first chunk path (bring-up fix, single-node transport): a
+        // dag chunk held locally is served straight from storage — no
+        // outbound stream per chunk (the self-dial fails under load for
+        // ~277MB chunked content and serializes hundreds of round-trips).
+        if ( auto localChunk = getLocalBlock( nextCid ) )
+        {
+            logger_->error( "[LF-DIAG] chunk hit local store: {}", cidToString( nextCid ) );
+            boost::asio::dispatch( *context_,
+                [this, ctx, nextCid, block = std::move( localChunk.value() )]() mutable
+                {
+                    handleQueuedBlockResult( ctx, nextCid, std::move( block ) );
+                } );
+            return;
+        }
 
         if ( ctx->peerInfo.has_value() )
         {
@@ -1515,6 +1566,31 @@ namespace sgns::ipfs_bitswap
 
         logger_->info( "Successfully published raw data with CID: {}", cidToString( rootCID ) );
         onPublishCallback( rootCID );
+    }
+
+    libp2p::outcome::result<std::string> Bitswap::getLocalBlock( const CID &cid )
+    {
+        // Memory first, then lazy-load from the disk index (persisted blocks
+        // of previously published content). Never dials — the caller uses a
+        // nullopt result to fall through to the network path.
+        {
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            auto                        blockIt = blockStore_.find( cid );
+            if ( blockIt != blockStore_.end() )
+            {
+                return blockIt->second.data;
+            }
+        }
+        if ( tryLoadFromDisk( cid ) )
+        {
+            std::lock_guard<std::mutex> guard( mutexBlockStore_ );
+            auto                        blockIt = blockStore_.find( cid );
+            if ( blockIt != blockStore_.end() )
+            {
+                return blockIt->second.data;
+            }
+        }
+        return libp2p::outcome::failure( BitswapError::BLOCK_NOT_FOUND );
     }
 
     bool Bitswap::HasBlock( const CID &cid ) const
