@@ -172,6 +172,14 @@ namespace sgns::ipfs_bitswap
         std::map<CID, std::string>    cidToPath;
         std::map<CID, ChunkInfo>      chunkToCidIndex;
 
+        // One-shot completion (elmbridge 04-05): the final content callback
+        // must fire exactly once. Without the flag, a second
+        // checkContentRequestComplete (e.g. the root's trailing call after the
+        // last chunk already completed the request) re-invoked the callback
+        // with the moved-from collectedFiles — an EMPTY result that overwrote
+        // the real one at the fetcher.
+        bool callbackFired = false;
+
         boost::asio::deadline_timer      timeout;
         bool                             timedOut = false;
         boost::posix_time::time_duration contentTimeout_;

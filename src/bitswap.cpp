@@ -676,24 +676,18 @@ namespace sgns::ipfs_bitswap
         }
         auto node = std::move( nodeResult.value() );
 
-        logger_->debug( "[LF] processUnixFSBlock cid={} links={} type={} isKnownChunk={}",
+        logger_->debug( "[LF] processUnixFSBlock cid={} links={} isKnownChunk={}",
                         cidToString( cid ),
                         node.links.size(),
-                        static_cast<int>( 0 ),
                         ctx->chunkToCidIndex.count( cid ) > 0 );
 
-        // Queue any new links
-        for ( const auto &link : node.links )
-        {
-            if ( ctx->completedCIDs.count( link.cid ) == 0 )
-            {
-                ctx->pendingCIDs.insert( link.cid );
-                ctx->requestQueue.push( link.cid );
-                processRequestQueue( ctx );
-            }
-        }
-
-        // Parse UnixFS data
+        // Parse UnixFS data BEFORE queueing links: for a multi-chunk file,
+        // handleFileBlock (below) registers the chunkToCidIndex entries that
+        // let chunk blocks route to handleFileChunk. Queueing first raced the
+        // local-first chunk dispatch (which runs INLINE on this thread via
+        // boost::asio::dispatch) past the registration — every chunk then
+        // took the single-file branch and completed separately (bring-up
+        // finding: 262144/262144/41976 completions, zero assemblies).
         unixfs_pb::Data unixfsData;
         if ( !node.data ||
              !unixfsData.ParseFromArray( node.data->data(), static_cast<int>( node.data->size() ) ) )
@@ -710,6 +704,21 @@ namespace sgns::ipfs_bitswap
             default:
                 handleFileBlock( ctx, cid, unixfsData, node.links, path );
                 break;
+        }
+
+        // Queue new links AFTER the handlers above: handleFileBlock has now
+        // registered chunkToCidIndex for multi-chunk files, so the queued
+        // chunks (dispatched inline by the local-first fast path) route
+        // correctly to handleFileChunk. (Moved from before the parse — see
+        // the ordering note above.)
+        for ( const auto &link : node.links )
+        {
+            if ( ctx->completedCIDs.count( link.cid ) == 0 )
+            {
+                ctx->pendingCIDs.insert( link.cid );
+                ctx->requestQueue.push( link.cid );
+                processRequestQueue( ctx );
+            }
         }
 
         checkContentRequestComplete( std::move( ctx ) );
@@ -960,13 +969,14 @@ namespace sgns::ipfs_bitswap
 
     void Bitswap::checkContentRequestComplete( std::shared_ptr<ContentRequestContext> ctx )
     {
-        if ( ctx->timedOut || !ctx->pendingCIDs.empty() || !ctx->filesInProgress.empty() )
+        if ( ctx->timedOut || ctx->callbackFired || !ctx->pendingCIDs.empty() || !ctx->filesInProgress.empty() )
         {
             return;
         }
 
         UnixFSContent content = assembleContent( ctx );
         ctx->timeout.cancel();
+        ctx->callbackFired = true; // one-shot: never a second (empty) delivery
         ctx->callback( std::move( content ) );
 
         std::lock_guard<std::mutex> guard( mutexContentRequests_ );
