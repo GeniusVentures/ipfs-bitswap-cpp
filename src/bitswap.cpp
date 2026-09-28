@@ -590,6 +590,13 @@ namespace sgns::ipfs_bitswap
         ctx->callback     = std::move( onContentCallback );
         ctx->useProviders = useProviders;
         ctx->pendingCIDs.insert( cid );
+        // Lifetime pin (elmbridge 04-05, UAF fix): arm the self-reference so
+        // the context outlives every queued/in-flight continuation
+        // regardless of when the contentRequests_ map entry is erased
+        // (completion, timeout, or failContentRequest). Cleared at
+        // successful completion; a timed-out/failed request simply keeps the
+        // pin until the last handler drops it.
+        ctx->selfPin      = ctx;
 
         {
             std::lock_guard<std::mutex> guard( mutexContentRequests_ );
@@ -969,7 +976,16 @@ namespace sgns::ipfs_bitswap
 
     void Bitswap::checkContentRequestComplete( std::shared_ptr<ContentRequestContext> ctx )
     {
-        if ( ctx->timedOut || ctx->callbackFired || !ctx->pendingCIDs.empty() || !ctx->filesInProgress.empty() )
+        // Completion condition (elmbridge 04-05, UAF fix): the request is
+        // complete only when NOTHING is pending, in flight, or still queued.
+        // The old check ignored requestQueue/processingQueue: on large
+        // multi-chunk walks pendingCIDs momentarily drains while the queue
+        // still holds dozens of chunk CIDs (the 200ms requeue timer +
+        // inline-dispatch interleaving), firing the content callback EARLY
+        // (observed: "Assembled complete file" at chunk ~948 of 1061) and
+        // erasing the map's shared_ptr while queued handlers kept running.
+        if ( ctx->timedOut || ctx->callbackFired || !ctx->pendingCIDs.empty() || !ctx->filesInProgress.empty()
+            || !ctx->requestQueue.empty() || ctx->processingQueue )
         {
             return;
         }
@@ -981,6 +997,13 @@ namespace sgns::ipfs_bitswap
 
         std::lock_guard<std::mutex> guard( mutexContentRequests_ );
         contentRequests_.erase( ctx->rootCID );
+
+        // Lifetime pin: late continuations (already-dispatched handlers, the
+        // requeue timer) may still touch *ctx after this frame returns. The
+        // selfPin keeps the context allocated until the last holder drops;
+        // clear it LAST so the destructor (if this was the final owner)
+        // cannot run while this function still executes.
+        ctx->selfPin.reset();
     }
 
     UnixFSContent Bitswap::assembleContent( std::shared_ptr<ContentRequestContext> ctx )

@@ -180,6 +180,18 @@ namespace sgns::ipfs_bitswap
         // the real one at the fetcher.
         bool callbackFired = false;
 
+        // Lifetime pin (elmbridge 04-05, UAF fix): while any walk work is
+        // queued or in flight, the context keeps itself alive via this
+        // self-shared_ptr. checkContentRequestComplete previously erased the
+        // contentRequests_ map entry (the last external owner) the moment
+        // pendingCIDs+filesInProgress drained — but queued
+        // handleQueuedBlockResult/processUnixFSBlock continuations (200ms
+        // requeue timer, inline dispatches) still executed afterward on the
+        // FREED context (0xC0000005 at the end of large multi-chunk walks,
+        // ~30-40% of cold 278MB fetches). Cleared by releaseWhenIdle once
+        // queue + in-flight + file work are all drained.
+        std::shared_ptr<ContentRequestContext> selfPin;
+
         boost::asio::deadline_timer      timeout;
         bool                             timedOut = false;
         boost::posix_time::time_duration contentTimeout_;
