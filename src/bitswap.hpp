@@ -108,7 +108,9 @@ namespace sgns::ipfs_bitswap
     class BitswapRequestContext : public std::enable_shared_from_this<BitswapRequestContext>
     {
     public:
-        BitswapRequestContext( boost::asio::io_context &context );
+        BitswapRequestContext( boost::asio::io_context          &context,
+                               boost::posix_time::time_duration responseTimeout
+                                   = boost::posix_time::seconds( 5 ) );
 
         void AddCallback( BlockCallback callback );
         void HandleResponse( libp2p::outcome::result<std::string> block );
@@ -117,13 +119,16 @@ namespace sgns::ipfs_bitswap
         void HandleResponseTimeout();
 
         /**
-         * @mutex mutex_ — Guards callbacks_ list and responseTimer_.
+         * @mutex mutex_ — Guards callbacks_ list, responseTimer_, and completed_.
          *   Acquired in AddCallback() (under outer mutexRequestCallbacks_ in messageSent)
          *   and HandleResponse(). HandleResponseTimeout() does NOT acquire mutex_ —
          *   it forwards to HandleResponse which handles its own locking.
+         *   Callbacks are moved out under the lock and invoked only after its
+         *   release (D-04) — consumer code may re-enter Bitswap freely.
          */
         std::mutex                       mutex_;
         std::list<BlockCallback>         callbacks_;
+        bool                             completed_ = false;
         boost::asio::deadline_timer      responseTimer_;
         boost::posix_time::time_duration responseTimeout_;
     };

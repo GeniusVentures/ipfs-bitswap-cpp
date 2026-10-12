@@ -62,8 +62,10 @@ namespace
 
 namespace sgns::ipfs_bitswap
 {
-    BitswapRequestContext::BitswapRequestContext( boost::asio::io_context &context ) :
-        responseTimer_( context ), responseTimeout_( boost::posix_time::seconds( 5 ) )
+    BitswapRequestContext::BitswapRequestContext(
+        boost::asio::io_context          &context,
+        boost::posix_time::time_duration responseTimeout ) :
+        responseTimer_( context ), responseTimeout_( responseTimeout )
     {
     }
 
@@ -76,7 +78,15 @@ namespace sgns::ipfs_bitswap
         // external shared_ptr is released (requestContexts_.erase) while the
         // timer is still pending, and the later handler runs on freed memory.
         responseTimer_.async_wait(
-            [self = shared_from_this()]( const boost::system::error_code & ) {
+            [self = shared_from_this()]( const boost::system::error_code &ec ) {
+                // A canceled wait (completion disarm, consumer Cancel, or io
+                // shutdown) arrives with operation_aborted — a canceled timer
+                // is never a timeout; bail before the failure path (BSTP-01,
+                // same ec-guard shape as the ContentRequestContext handler).
+                if ( ec )
+                {
+                    return;
+                }
                 self->HandleResponseTimeout();
             } );
         callbacks_.emplace_back( std::move( callback ) );
@@ -84,18 +94,32 @@ namespace sgns::ipfs_bitswap
 
     void BitswapRequestContext::HandleResponse( libp2p::outcome::result<std::string> block )
     {
-        std::lock_guard<std::mutex> guard( mutex_ );
-        responseTimer_.expires_at( boost::posix_time::pos_infin );
-        for ( auto &callback : callbacks_ )
+        std::list<BlockCallback> callbacksToInvoke;
+        {
+            std::lock_guard<std::mutex> guard( mutex_ );
+            if ( completed_ )
+            {
+                // A terminal result (success, timeout, or cancel) was already
+                // delivered — drop the late transition (BSTP-02).
+                return;
+            }
+            completed_         = true;
+            responseTimer_.cancel();
+            callbacksToInvoke  = std::move( callbacks_ );
+            callbacks_.clear();
+        }
+        // Invoke consumers only after the lock is released — a callback may
+        // re-enter Bitswap freely (D-04, same shape as the C-7 fix in
+        // processReceivedBlocks).
+        for ( auto &callback : callbacksToInvoke )
         {
             callback( block );
         }
-        callbacks_.clear();
     }
 
     void BitswapRequestContext::HandleResponseTimeout()
     {
-        HandleResponse( BitswapError::OUTBOUND_STREAM_FAILURE );
+        HandleResponse( BitswapError::REQUEST_TIMEOUT );
     }
 
     ContentRequestContext::ContentRequestContext( boost::asio::io_context &context, CID rootCid ) :
