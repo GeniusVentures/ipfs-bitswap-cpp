@@ -110,3 +110,31 @@ set_target_properties(bitswap_persistence_test PROPERTIES
 )
 
 add_test(NAME BitswapPersistenceTest COMMAND bitswap_persistence_test)
+
+# ── Bitswap request timer race test (GTest via addtest) ──
+addtest(bitswap_request_timer_race_test
+    bitswap_request_timer_race_test.cpp
+)
+
+target_link_libraries(bitswap_request_timer_race_test
+    ipfs-bitswap-cpp
+    ipfs-bitswap-proto
+    ipfs-unixfs-proto
+    ipfs-merkledag-proto
+    spdlog::spdlog
+    Boost::Boost.DI
+    p2p::p2p_basic_host
+    p2p::p2p_multiaddress
+    p2p::p2p_ping
+    p2p::p2p_identify
+    p2p::p2p_identify_proto
+    p2p::p2p_default_host
+    p2p::p2p_default_network
+    ipfs-lite-cpp::ipld_node
+    ${WIN_CRYPT_LIBRARY}
+    ${Boost_LIBRARIES}
+)
+
+target_include_directories(bitswap_request_timer_race_test PRIVATE
+    ${GSL_INCLUDE_DIR}
+)
