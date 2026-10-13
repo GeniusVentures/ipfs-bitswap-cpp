@@ -123,20 +123,41 @@ namespace sgns::ipfs_bitswap
          */
         void Cancel();
 
+        /**
+         * @brief Advisory outer-tier completed check — used by Bitswap
+         *        (messageSent) to decide requestContexts_ reuse vs
+         *        replacement. TOCTOU by design: the context may complete
+         *        between this check and a later AddCallback; AddCallback's
+         *        internal completed-branch remains authoritative (replay of
+         *        the stored terminal result, or silent drop on the
+         *        consumer-canceled terminal).
+         */
+        bool IsCompleted() const;
+
     private:
         void HandleResponseTimeout();
 
         /**
-         * @mutex mutex_ — Guards callbacks_ list, responseTimer_, and completed_.
-         *   Acquired in AddCallback() (under outer mutexRequestCallbacks_ in messageSent)
-         *   and HandleResponse(). HandleResponseTimeout() does NOT acquire mutex_ —
-         *   it forwards to HandleResponse which handles its own locking.
-         *   Callbacks are moved out under the lock and invoked only after its
-         *   release (D-04) — consumer code may re-enter Bitswap freely.
+         * @mutex mutex_ — Guards callbacks_ list, responseTimer_, completed_,
+         *   and terminalResult_. Declared mutable so the const IsCompleted()
+         *   accessor can lock it. Acquired in AddCallback(), IsCompleted(),
+         *   and HandleResponse(). Phase 2: AddCallback is invoked OUTSIDE the
+         *   outer mutexRequestCallbacks_ scope in messageSent — no Bitswap
+         *   mutex is ever held on a dispatching stack. HandleResponseTimeout()
+         *   does NOT acquire mutex_ — it forwards to HandleResponse which
+         *   handles its own locking. Callbacks are moved out under the lock
+         *   and invoked only after its release (D-04); the D-02 synchronous
+         *   replay likewise runs only after this lock is released — consumer
+         *   code may re-enter Bitswap freely.
          */
-        std::mutex                       mutex_;
+        mutable std::mutex               mutex_;
         std::list<BlockCallback>         callbacks_;
         bool                             completed_ = false;
+        // D-01 replay store — the terminal outcome (success blocks or
+        // REQUEST_TIMEOUT) remembered for synchronous replay to late
+        // subscribers (D-03); empty on the consumer-canceled terminal
+        // (BSTP-03: cancel stores nothing, late registration is dropped).
+        std::optional<libp2p::outcome::result<std::string>> terminalResult_;
         boost::asio::deadline_timer      responseTimer_;
         boost::posix_time::time_duration responseTimeout_;
     };

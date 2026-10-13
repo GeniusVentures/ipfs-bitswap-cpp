@@ -71,25 +71,51 @@ namespace sgns::ipfs_bitswap
 
     void BitswapRequestContext::AddCallback( BlockCallback callback )
     {
-        std::lock_guard<std::mutex> guard( mutex_ );
-        responseTimer_.expires_from_now( responseTimeout_ );
-        // Capture shared_from_this so the armed timer keeps the context
-        // alive until it fires — a raw `this` capture dangles once the last
-        // external shared_ptr is released (requestContexts_.erase) while the
-        // timer is still pending, and the later handler runs on freed memory.
-        responseTimer_.async_wait(
-            [self = shared_from_this()]( const boost::system::error_code &ec ) {
-                // A canceled wait (completion disarm, consumer Cancel, or io
-                // shutdown) arrives with operation_aborted — a canceled timer
-                // is never a timeout; bail before the failure path (BSTP-01,
-                // same ec-guard shape as the ContentRequestContext handler).
-                if ( ec )
-                {
-                    return;
-                }
-                self->HandleResponseTimeout();
-            } );
-        callbacks_.emplace_back( std::move( callback ) );
+        std::optional<libp2p::outcome::result<std::string>> replayResult;
+        {
+            std::lock_guard<std::mutex> guard( mutex_ );
+            if ( completed_ )
+            {
+                // D-01/D-03: a late subscriber receives the stored terminal
+                // outcome (success blocks or REQUEST_TIMEOUT). An empty store
+                // means the consumer-canceled terminal — the callback is
+                // dropped without invocation and without arming anything
+                // (BSTP-03 symmetry: cancel produces no callback of any kind).
+                replayResult = terminalResult_;
+            }
+            else
+            {
+                responseTimer_.expires_from_now( responseTimeout_ );
+                // Capture shared_from_this so the armed timer keeps the context
+                // alive until it fires — a raw `this` capture dangles once the
+                // last external shared_ptr is released while the timer is
+                // still pending, and the later handler runs on freed memory
+                // (under D-04 retention the map entry is itself a long-lived
+                // owner until a same-CID request replaces it).
+                responseTimer_.async_wait(
+                    [self = shared_from_this()]( const boost::system::error_code &ec ) {
+                        // A canceled wait (completion disarm, consumer Cancel, or io
+                        // shutdown) arrives with operation_aborted — a canceled timer
+                        // is never a timeout; bail before the failure path (BSTP-01,
+                        // same ec-guard shape as the ContentRequestContext handler).
+                        if ( ec )
+                        {
+                            return;
+                        }
+                        self->HandleResponseTimeout();
+                    } );
+                callbacks_.emplace_back( std::move( callback ) );
+            }
+        }
+        // D-02: synchronous replay — invoked only after every mutex on this
+        // stack (mutex_ here, any outer Bitswap mutex at the call site) is
+        // released. Never arms the timer (SC3 clause 2: no fresh timer on a
+        // completed request); a canceled-terminal registration (empty store)
+        // is dropped silently above.
+        if ( replayResult && callback )
+        {
+            callback( *replayResult );
+        }
     }
 
     void BitswapRequestContext::HandleResponse( libp2p::outcome::result<std::string> block )
@@ -104,6 +130,11 @@ namespace sgns::ipfs_bitswap
                 return;
             }
             completed_         = true;
+            // D-01: remember the terminal outcome for replay to late
+            // subscribers — HandleResponseTimeout funnels REQUEST_TIMEOUT
+            // through here, so the D-03 both-outcomes symmetry falls out of
+            // this single store site. Cancel() stores nothing.
+            terminalResult_    = block;
             responseTimer_.cancel();
             callbacksToInvoke  = std::move( callbacks_ );
             callbacks_.clear();
@@ -132,6 +163,12 @@ namespace sgns::ipfs_bitswap
         completed_ = true;
         responseTimer_.cancel();
         callbacks_.clear();
+    }
+
+    bool BitswapRequestContext::IsCompleted() const
+    {
+        std::lock_guard<std::mutex> guard( mutex_ );
+        return completed_;
     }
 
     ContentRequestContext::ContentRequestContext( boost::asio::io_context &context, CID rootCid ) :
@@ -328,7 +365,11 @@ namespace sgns::ipfs_bitswap
                         markProviderSuccess( cid.value(), remotePeer.value() );
                     }
                     ctx = itContext->second;
-                    requestContexts_.erase( itContext );
+                    // D-04 retention: the completion flag (not map erase)
+                    // selects the single winner — a duplicate or late block
+                    // for this CID hits HandleResponse's completed gate and
+                    // dispatches nothing; the entry is retained until a
+                    // same-CID request replaces it in messageSent.
                 }
                 else
                 {
@@ -377,20 +418,31 @@ namespace sgns::ipfs_bitswap
             return;
         }
 
+        std::shared_ptr<BitswapRequestContext> requestContext;
         {
             std::lock_guard<std::mutex> callbacksGuard( mutexRequestCallbacks_ );
             auto                        itCallbacks = requestContexts_.find( cid );
-            if ( itCallbacks != requestContexts_.end() )
+            if ( itCallbacks != requestContexts_.end() && !itCallbacks->second->IsCompleted() )
             {
-                itCallbacks->second->AddCallback( std::move( onBlockCallback ) );
+                requestContext = itCallbacks->second; // pending request — join it
             }
             else
             {
-                auto requestContext = std::make_shared<BitswapRequestContext>( *context_ );
-                requestContext->AddCallback( std::move( onBlockCallback ) );
-                requestContexts_.emplace( cid, std::move( requestContext ) );
+                requestContext = std::make_shared<BitswapRequestContext>( *context_ );
+                // D-04: insert-or-replace — completed entries are retained
+                // only until a new same-CID request replaces them; there is no
+                // erase-on-complete anywhere (retention-until-replaced).
+                requestContexts_[cid] = requestContext;
             }
         }
+        // BSTP-04: registration strictly OUTSIDE the mutexRequestCallbacks_
+        // scope — the context may complete between the IsCompleted check
+        // above and this call, so AddCallback's D-02 replay can synchronously
+        // execute consumer code on this very stack; it must do so with every
+        // Bitswap mutex released (the registering caller tolerates its
+        // callback on its own stack — the same guarantee BSTP-05 gives
+        // consumers).
+        requestContext->AddCallback( std::move( onBlockCallback ) );
 
         // Listen for server response
         auto rw = std::make_shared<libp2p::basic::ProtobufMessageReadWriter>( stream );
