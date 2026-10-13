@@ -16,9 +16,20 @@
 //               flag (BSTP-03)
 //   consumer cancel: Cancel() retires the request with zero callbacks (BSTP-03)
 //   dispatch shape: multi-callback registration order; zero-callback terminal
-//   late registration: a callback registered on a completed context receives
-//               the stored terminal result synchronously, no fresh timer
-//               (D-01..D-03, SC3 clause 2)
+//   late registration (D-01..D-03, SC3 clause 2, A2): a callback registered on
+//               a completed context receives the stored terminal result
+//               synchronously — success or REQUEST_TIMEOUT — and a canceled
+//               terminal drops it silently, no fresh timer in any case:
+//               LateRegistrationOnCompletedReplaysStoredSuccess,
+//               LateRegistrationOnTimedOutReplaysRequestTimeout,
+//               LateRegistrationOnCanceledContextIsDroppedNoTimerArmed
+//   reentrancy (D-05a/D-05b, BSTP-05): a consumer callback may re-enter the
+//               context synchronously — cancel its own request, chain a new
+//               request, register on a completed context (D-08 collision) —
+//               without deadlock or use-after-free:
+//               ReentrantCancelOwnRequestNoDeadlock,
+//               ReentrantChainNewRequestCallbackFires,
+//               ReentrantAddCallbackOnCompletedDeliversReplayInline
 #include <gtest/gtest.h>
 
 #include <boost/asio.hpp>
@@ -402,5 +413,288 @@ TEST( RequestContextRaceTest, LateRegistrationOnCompletedReplaysStoredSuccess )
     EXPECT_EQ( replayedValue, "block-data" );
 
     // SC3 clause 2: no fresh timer armed on the completed request.
+    EXPECT_EQ( io.poll(), 0 );
+}
+
+/**
+ * @given a BitswapRequestContext armed with a long (60 s) timeout and one
+ *        registered callback
+ * @when the request completes and the callback body synchronously re-enters
+ *       the context and calls Cancel() on its own request
+ * @then Cancel() RETURNS (no self-deadlock — dispatch holds no mutex),
+ *       exactly one success callback was delivered (BSTP-03: cancel after a
+ *       terminal result changes nothing), and the drained io_context reports
+ *       zero ready handlers (no fresh timer)
+ */
+TEST( RequestContextRaceTest, ReentrantCancelOwnRequestNoDeadlock )
+{
+    boost::asio::io_context io;
+
+    auto context = std::make_shared<BitswapRequestContext>(
+        io, boost::posix_time::seconds( 60 ) );
+
+    int successCount   = 0;
+    int cancelReturned = 0;
+
+    std::weak_ptr<BitswapRequestContext> weak( context );
+
+    context->AddCallback( [&successCount, &cancelReturned, &weak](
+                              libp2p::outcome::result<std::string> result ) {
+        if ( result )
+        {
+            ++successCount;
+        }
+        // D-05a: synchronously re-enter and cancel the request whose
+        // dispatch we are inside — the dispatch loop holds no mutex, so
+        // Cancel() must acquire mutex_, see completed_, and return.
+        if ( auto locked = weak.lock() )
+        {
+            locked->Cancel();
+            ++cancelReturned; // reached only if Cancel() returned
+        }
+    } );
+
+    context->HandleResponse( std::string( "block-data" ) );
+
+    // Bounded drain (D-06): cap the stepping — every non-hang regression is
+    // a red count assertion below; an inline hang is triaged at verification
+    // as a red lock-inversion signal (A4).
+    for ( int step = 0; step < 100 && io.poll() > 0; ++step )
+    {
+    }
+
+    EXPECT_EQ( successCount, 1 );
+    EXPECT_EQ( cancelReturned, 1 );
+    EXPECT_EQ( io.poll(), 0 );
+}
+
+/**
+ * @given a BitswapRequestContext (ctx1) armed with a long (60 s) timeout and
+ *        one registered callback
+ * @when ctx1 completes and its callback body constructs a FRESH context ctx2
+ *       on the same io_context, registers a callback on it, and completes it
+ *       INLINE via HandleResponse (A4 resolution — the reentrant call chain
+ *       completes on the caller's stack, no posted work)
+ * @then ctx1's callback delivered exactly once, ctx2's callback fired exactly
+ *       once with the chained payload — chaining works through a live
+ *       callback without deadlock or use-after-free (BSTP-05)
+ */
+TEST( RequestContextRaceTest, ReentrantChainNewRequestCallbackFires )
+{
+    boost::asio::io_context io;
+
+    auto ctx1 = std::make_shared<BitswapRequestContext>(
+        io, boost::posix_time::seconds( 60 ) );
+
+    int         rootCount    = 0;
+    int         chainedCount = 0;
+    std::string chainedValue;
+
+    ctx1->AddCallback( [&rootCount, &chainedCount, &chainedValue, &io](
+                           libp2p::outcome::result<std::string> result ) {
+        if ( result )
+        {
+            ++rootCount;
+        }
+        // D-05b: chain a new request from inside a live callback.
+        auto ctx2 = std::make_shared<BitswapRequestContext>(
+            io, boost::posix_time::seconds( 60 ) );
+        ctx2->AddCallback( [&chainedCount, &chainedValue](
+                               libp2p::outcome::result<std::string> chained ) {
+            if ( chained )
+            {
+                ++chainedCount;
+                chainedValue = chained.value();
+            }
+        } );
+        ctx2->HandleResponse( std::string( "chained-block" ) );
+    } );
+
+    ctx1->HandleResponse( std::string( "root-block" ) );
+
+    for ( int step = 0; step < 100 && io.poll() > 0; ++step )
+    {
+    }
+
+    EXPECT_EQ( rootCount, 1 );
+    EXPECT_EQ( chainedCount, 1 );
+    EXPECT_EQ( chainedValue, "chained-block" );
+    EXPECT_EQ( io.poll(), 0 );
+}
+
+/**
+ * @given a BitswapRequestContext armed with a negative (-1 ms, unambiguously
+ *        expired) deadline and one on-time callback
+ * @when the genuine timeout fires (single run_one() extraction), then TWO
+ *       late registrations land on the completed context
+ * @then both late subscribers receive the STORED REQUEST_TIMEOUT error
+ *       synchronously — each before its AddCallback returns — and BOTH
+ *       observed error VALUES equal static_cast<int>(BitswapError::REQUEST_TIMEOUT)
+ *       exactly as the on-time subscriber did (D-03 symmetry + the ordering
+ *       fold: identical stored value to both); no fresh timer is armed
+ */
+TEST( RequestContextRaceTest, LateRegistrationOnTimedOutReplaysRequestTimeout )
+{
+    boost::asio::io_context io;
+
+    auto context = std::make_shared<BitswapRequestContext>(
+        io, boost::posix_time::milliseconds( -1 ) );
+
+    int onTimeErrors = 0;
+
+    context->AddCallback( [&onTimeErrors](
+                              libp2p::outcome::result<std::string> result ) {
+        if ( !result )
+        {
+            ++onTimeErrors;
+        }
+    } );
+
+    // Fire the genuine expiry deterministically (A3: run_one() extracts an
+    // already-expired deadline every run on this platform).
+    io.run_one();
+
+    while ( io.poll() > 0 )
+    {
+    }
+
+    int         lateErrors     = 0;
+    int         lastErrorValue = -1;
+    bool        firstReplayedBeforeReturn  = false;
+    bool        secondReplayedBeforeReturn = false;
+
+    context->AddCallback(
+        [&lateErrors, &lastErrorValue, &firstReplayedBeforeReturn](
+            libp2p::outcome::result<std::string> result ) {
+            if ( !result )
+            {
+                ++lateErrors;
+                lastErrorValue = result.error().value();
+            }
+            firstReplayedBeforeReturn = true; // set inside body — D-02 proof
+        } );
+    EXPECT_TRUE( firstReplayedBeforeReturn );
+
+    context->AddCallback(
+        [&lateErrors, &lastErrorValue, &secondReplayedBeforeReturn](
+            libp2p::outcome::result<std::string> result ) {
+            if ( !result )
+            {
+                ++lateErrors;
+                lastErrorValue = result.error().value();
+            }
+            secondReplayedBeforeReturn = true;
+        } );
+    EXPECT_TRUE( secondReplayedBeforeReturn );
+
+    EXPECT_EQ( onTimeErrors, 1 );
+    EXPECT_EQ( lateErrors, 2 );
+    EXPECT_EQ( lastErrorValue, static_cast<int>( BitswapError::REQUEST_TIMEOUT ) );
+
+    // SC3 clause 2: no fresh timer armed for the late registrations.
+    EXPECT_EQ( io.poll(), 0 );
+}
+
+/**
+ * @given a BitswapRequestContext completed once via HandleResponse, with a
+ *        live outer callback still executing in its dispatch loop
+ * @when the outer callback body reentrantly registers a second callback on
+ *       the SAME completed context (D-08: the SC3 replay × BSTP-05 reentrancy
+ *       collision)
+ * @then the D-02 replay is delivered synchronously INSIDE the outer
+ *       callback's stack — the outer body observes the replay flag already
+ *       set immediately after the nested AddCallback returns and before the
+ *       outer body finishes — with no deadlock, the stored payload intact,
+ *       exactly 2 total invocations, and no fresh timer
+ */
+TEST( RequestContextRaceTest, ReentrantAddCallbackOnCompletedDeliversReplayInline )
+{
+    boost::asio::io_context io;
+
+    auto context = std::make_shared<BitswapRequestContext>(
+        io, boost::posix_time::seconds( 60 ) );
+
+    int  totalInvocations = 0;
+    bool replayRanDuringOuterBody = false; // set by the inner replay
+    bool outerObservedReplayInline = false;
+    bool replayValueDelivered     = false;
+
+    std::weak_ptr<BitswapRequestContext> weak( context );
+
+    context->AddCallback(
+        [&totalInvocations, &replayRanDuringOuterBody, &outerObservedReplayInline,
+         &replayValueDelivered, &weak]( libp2p::outcome::result<std::string> ) {
+            ++totalInvocations; // outer invocation #1
+            if ( auto locked = weak.lock() )
+            {
+                locked->AddCallback(
+                    [&totalInvocations, &replayRanDuringOuterBody, &replayValueDelivered](
+                        libp2p::outcome::result<std::string> replayed ) {
+                        ++totalInvocations; // inner replay #2
+                        if ( replayed && replayed.value() == "d08-block" )
+                        {
+                            replayValueDelivered = true;
+                        }
+                        replayRanDuringOuterBody = true;
+                    } );
+                // Read AFTER the nested AddCallback returned and BEFORE this
+                // outer body returns: true here proves the replay executed
+                // inline on this very stack (D-02/D-08).
+                outerObservedReplayInline = replayRanDuringOuterBody;
+            }
+        } );
+
+    context->HandleResponse( std::string( "d08-block" ) );
+
+    for ( int step = 0; step < 100 && io.poll() > 0; ++step )
+    {
+    }
+
+    EXPECT_TRUE( outerObservedReplayInline );
+    EXPECT_TRUE( replayValueDelivered );
+    EXPECT_EQ( totalInvocations, 2 );
+    EXPECT_EQ( io.poll(), 0 );
+}
+
+/**
+ * @given a BitswapRequestContext canceled by its consumer (BSTP-03 terminal,
+ *        terminal store EMPTY — cancel stores nothing) with one registered
+ *        callback
+ * @when a second, late callback is registered on the canceled context
+ * @then the late registration is dropped silently — ZERO invocations across
+ *       both callbacks, zero timers armed (A2 resolution: symmetric with
+ *       cancel-produces-no-callback; D-03 names only success and
+ *       REQUEST_TIMEOUT as replayable outcomes) — and the drained io_context
+ *       reports zero ready handlers
+ */
+TEST( RequestContextRaceTest, LateRegistrationOnCanceledContextIsDroppedNoTimerArmed )
+{
+    boost::asio::io_context io;
+
+    auto context = std::make_shared<BitswapRequestContext>(
+        io, boost::posix_time::seconds( 60 ) );
+
+    int totalInvocations = 0;
+
+    context->AddCallback( [&totalInvocations](
+                              libp2p::outcome::result<std::string> ) {
+        ++totalInvocations;
+    } );
+
+    context->Cancel();
+
+    // Late registration on the canceled terminal — dropped, not replayed.
+    context->AddCallback( [&totalInvocations](
+                              libp2p::outcome::result<std::string> ) {
+        ++totalInvocations;
+    } );
+
+    for ( int step = 0; step < 100 && io.poll() > 0; ++step )
+    {
+    }
+
+    EXPECT_EQ( totalInvocations, 0 );
+
+    // No timer was armed for the late registration (SC3 clause 2, A2 shape).
     EXPECT_EQ( io.poll(), 0 );
 }
