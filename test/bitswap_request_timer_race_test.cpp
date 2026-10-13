@@ -16,6 +16,9 @@
 //               flag (BSTP-03)
 //   consumer cancel: Cancel() retires the request with zero callbacks (BSTP-03)
 //   dispatch shape: multi-callback registration order; zero-callback terminal
+//   late registration: a callback registered on a completed context receives
+//               the stored terminal result synchronously, no fresh timer
+//               (D-01..D-03, SC3 clause 2)
 #include <gtest/gtest.h>
 
 #include <boost/asio.hpp>
@@ -338,5 +341,66 @@ TEST( RequestContextRaceTest, TerminalTransitionWithZeroCallbacksIsSafe )
     {
     }
 
+    EXPECT_EQ( io.poll(), 0 );
+}
+
+/**
+ * @given a BitswapRequestContext already completed via HandleResponse with a
+ *        known block payload (one on-time callback delivered, io drained)
+ * @when a second, LATE callback is registered on the completed context
+ * @then the late callback receives the stored terminal result synchronously
+ *       — before AddCallback returns (D-02) — with the identical stored value
+ *       (D-01/D-03), and no fresh timer is ever armed (SC3 clause 2)
+ */
+TEST( RequestContextRaceTest, LateRegistrationOnCompletedReplaysStoredSuccess )
+{
+    boost::asio::io_context io;
+
+    auto context = std::make_shared<BitswapRequestContext>(
+        io, boost::posix_time::seconds( 60 ) );
+
+    int         firstCount  = 0;
+    int         replayCount = 0;
+    std::string replayedValue;
+    bool        replayRanBeforeAddCallbackReturned = false;
+
+    context->AddCallback( [&firstCount](
+                              libp2p::outcome::result<std::string> result ) {
+        if ( result )
+        {
+            ++firstCount;
+        }
+    } );
+
+    context->HandleResponse( std::string( "block-data" ) );
+
+    // Drain so the aborted timer handler provably runs before late registration.
+    while ( io.poll() > 0 )
+    {
+    }
+
+    context->AddCallback(
+        [&replayCount, &replayedValue, &replayRanBeforeAddCallbackReturned](
+            libp2p::outcome::result<std::string> result ) {
+            if ( result )
+            {
+                ++replayCount;
+                replayedValue = result.value();
+            }
+            // Set INSIDE the callback body — a synchronous (D-02) replay has
+            // this flag true the moment AddCallback returns; a posted/queued
+            // delivery would leave it false at the assert below.
+            replayRanBeforeAddCallbackReturned = true;
+        } );
+
+    // Proven synchronous: the replay already executed before AddCallback
+    // returned — no stepping has run between registration and this assert.
+    EXPECT_TRUE( replayRanBeforeAddCallbackReturned );
+
+    EXPECT_EQ( firstCount, 1 );
+    EXPECT_EQ( replayCount, 1 );
+    EXPECT_EQ( replayedValue, "block-data" );
+
+    // SC3 clause 2: no fresh timer armed on the completed request.
     EXPECT_EQ( io.poll(), 0 );
 }
