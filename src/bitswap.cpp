@@ -122,6 +122,18 @@ namespace sgns::ipfs_bitswap
         HandleResponse( BitswapError::REQUEST_TIMEOUT );
     }
 
+    void BitswapRequestContext::Cancel()
+    {
+        std::lock_guard<std::mutex> guard( mutex_ );
+        if ( completed_ )
+        {
+            return;
+        }
+        completed_ = true;
+        responseTimer_.cancel();
+        callbacks_.clear();
+    }
+
     ContentRequestContext::ContentRequestContext( boost::asio::io_context &context, CID rootCid ) :
         rootCID( std::move( rootCid ) ), timeout( context ), contentTimeout_( boost::posix_time::seconds( 30 ) )
     {

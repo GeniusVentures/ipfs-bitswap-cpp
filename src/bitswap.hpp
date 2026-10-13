@@ -115,6 +115,14 @@ namespace sgns::ipfs_bitswap
         void AddCallback( BlockCallback callback );
         void HandleResponse( libp2p::outcome::result<std::string> block );
 
+        /**
+         * @brief Consumer-initiated cancellation — the request is retired with
+         *        NO callback of any kind (BSTP-03 consumer-cancel clause).
+         *        Sets completed_, cancels the timer, and clears callbacks under
+         *        mutex_; never invokes a consumer callback.
+         */
+        void Cancel();
+
     private:
         void HandleResponseTimeout();
 
